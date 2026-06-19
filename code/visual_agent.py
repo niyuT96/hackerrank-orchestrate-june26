@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -47,6 +47,23 @@ VISION_RISK_FLAGS = {
     "manual_review_required",
 }
 ALL_PARTS = set().union(*OBJECT_PARTS.values())
+ESCALATION_REASONS = {
+    "object_or_part_conflict",
+    "multi_image_identity_conflict",
+    "possible_manipulation",
+    "non_original_image",
+    "critical_field_conflict",
+    "primary_uncertain_or_unreviewable",
+    "text_instruction_present",
+}
+HIGH_RISK_FLAGS = {
+    "wrong_object",
+    "wrong_object_part",
+    "claim_mismatch",
+    "possible_manipulation",
+    "non_original_image",
+    "text_instruction_present",
+}
 
 
 @dataclass(frozen=True)
@@ -78,6 +95,32 @@ class RequirementObservation:
 
 
 @dataclass(frozen=True)
+class EscalationAudit:
+    reasons: tuple[str, ...]
+    status: str
+    review_model_name: str | None
+    attempts: int
+    conflicts: tuple[str, ...] = ()
+    diagnostics: tuple[str, ...] = ()
+    review_candidate: Mapping[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reasons": list(self.reasons),
+            "status": self.status,
+            "review_model_name": self.review_model_name,
+            "attempts": self.attempts,
+            "conflicts": list(self.conflicts),
+            "diagnostics": list(self.diagnostics),
+            "review_candidate": (
+                dict(self.review_candidate)
+                if self.review_candidate is not None
+                else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class ImageObservation:
     image_id: str
     path: str
@@ -94,6 +137,7 @@ class ImageObservation:
     model_name: str
     attempts: int
     diagnostics: tuple[str, ...] = ()
+    escalation: EscalationAudit | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -114,6 +158,11 @@ class ImageObservation:
             "model_name": self.model_name,
             "attempts": self.attempts,
             "diagnostics": list(self.diagnostics),
+            "escalation": (
+                self.escalation.to_dict()
+                if self.escalation is not None
+                else None
+            ),
         }
 
 
@@ -338,13 +387,11 @@ def image_observation_schema(
                 "type": "array",
                 "items": {"type": "string", "enum": sorted(ALL_PARTS)},
                 "minItems": 1,
-                "uniqueItems": True,
             },
             "visible_issue_types": {
                 "type": "array",
                 "items": {"type": "string", "enum": sorted(ISSUE_TYPES)},
                 "minItems": 1,
-                "uniqueItems": True,
             },
             "severity": {"type": "string", "enum": sorted(SEVERITIES)},
             "target_part_visibility": {
@@ -380,7 +427,6 @@ def image_observation_schema(
                     "enum": sorted(VISION_RISK_FLAGS),
                 },
                 "minItems": 1,
-                "uniqueItems": True,
             },
             "reviewable": {"type": "boolean"},
             "claim_target_clear": {"type": "boolean"},
@@ -432,7 +478,12 @@ def build_visual_prompt(
         "target is unknown, describe actual visible content but keep "
         "claim_target_clear=false and do not claim that an unspecified target "
         "was verified. Report every supplied requirement_id exactly once and "
-        "never invent IDs. Use only the allowed JSON schema.\n"
+        "never invent IDs. visible_parts must belong to actual_object. When "
+        "the claimed part is visible but no damage is visible, include "
+        "damage_not_visible. When a different concrete part is shown and the "
+        "claimed part is not visible, include wrong_object_part. When the "
+        "visible issue conflicts with the claimed issue, include "
+        "claim_mismatch. Use only the allowed JSON schema.\n"
         f"image_id={image.image_id}\n"
         f"path={image.path}\n"
         f"expected_claim_object={prepared.claim.claim_object}\n"
@@ -440,7 +491,38 @@ def build_visual_prompt(
         f"claimed_parts={list(parsed.claimed_parts)}\n"
         f"claimed_issue_types={list(parsed.claimed_issue_types)}\n"
         f"claimed_severity={parsed.claimed_severity}\n"
+        f"allowed_parts_by_object={json.dumps({key: sorted(value) for key, value in OBJECT_PARTS.items()})}\n"
         f"minimum_requirements={json.dumps(requirements, ensure_ascii=False)}"
+    )
+
+
+def build_review_prompt(
+    prepared: PreparedClaim,
+    image: ImageReference,
+    primary: ImageObservation,
+    reasons: tuple[str, ...],
+    peer_observations: tuple[ImageObservation, ...],
+) -> str:
+    peer_context = [
+        {
+            "image_id": item.image_id,
+            "actual_object": item.actual_object,
+            "visible_parts": list(item.visible_parts),
+            "risk_flags": list(item.risk_flags),
+        }
+        for item in peer_observations
+        if item.image_id != image.image_id
+    ]
+    return (
+        build_visual_prompt(prepared, image)
+        + "\nThis is a difficult-case escalation review. Independently inspect "
+        "the image and resolve the listed local routing concerns. Do not copy "
+        "the primary observation merely to agree with it. Do not issue a final "
+        "claim decision. If the image cannot resolve a concern, keep the "
+        "relevant field unknown and reviewable=false.\n"
+        f"fixed_escalation_reasons={json.dumps(reasons)}\n"
+        f"primary_observation={json.dumps(primary.to_dict(), ensure_ascii=False)}\n"
+        f"peer_observation_context={json.dumps(peer_context, ensure_ascii=False)}"
     )
 
 
@@ -591,6 +673,103 @@ def validate_image_observation(
         raise DataValidationError(
             "claim_target_clear cannot be true when claimed_parts is unknown"
         )
+    concrete_parts = set(observation.visible_parts) - {"unknown"}
+    if (
+        observation.actual_object == prepared.claim.claim_object
+        and claimed_parts
+        and concrete_parts
+        and not claimed_parts & concrete_parts
+        and observation.target_part_visibility == "not_visible"
+        and "wrong_object_part" not in observation.risk_flags
+    ):
+        raise DataValidationError(
+            "Visible non-claimed part with missing target requires "
+            "wrong_object_part risk"
+        )
+    if (
+        observation.target_part_visibility == "visible"
+        and observation.visible_issue_types == ("none",)
+        and "damage_not_visible" not in observation.risk_flags
+    ):
+        raise DataValidationError(
+            "Visible claimed part without damage requires damage_not_visible risk"
+        )
+    claimed_issues = (
+        set(prepared.parsed_claim.claimed_issue_types) - {"unknown", "none"}
+    )
+    visible_issues = set(observation.visible_issue_types) - {"unknown", "none"}
+    if (
+        claimed_issues
+        and visible_issues
+        and not claimed_issues & visible_issues
+        and "claim_mismatch" not in observation.risk_flags
+    ):
+        raise DataValidationError(
+            "Visible issue conflicting with claimed issue requires claim_mismatch risk"
+        )
+
+
+def local_escalation_reasons(
+    observation: ImageObservation,
+    prepared: PreparedClaim,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    risks = set(observation.risk_flags)
+    if risks & {"wrong_object", "wrong_object_part"}:
+        reasons.append("object_or_part_conflict")
+    if "possible_manipulation" in risks:
+        reasons.append("possible_manipulation")
+    if "non_original_image" in risks:
+        reasons.append("non_original_image")
+    if "claim_mismatch" in risks:
+        reasons.append("critical_field_conflict")
+    if "text_instruction_present" in risks:
+        reasons.append("text_instruction_present")
+    critical_unknown = any(
+        item.status == "unknown" for item in observation.requirement_results
+    )
+    if (
+        not observation.reviewable
+        or not observation.claim_target_clear
+        or observation.actual_object == "unknown"
+        or observation.visible_parts == ("unknown",)
+        or observation.visible_issue_types == ("unknown",)
+        or observation.severity == "unknown"
+        or observation.target_part_visibility == "unknown"
+        or critical_unknown
+    ):
+        reasons.append("primary_uncertain_or_unreviewable")
+    invalid = set(reasons) - ESCALATION_REASONS
+    if invalid:
+        raise AssertionError(f"Unknown escalation reasons: {sorted(invalid)}")
+    return tuple(dict.fromkeys(reasons))
+
+
+def case_escalation_reasons(
+    observations: tuple[ImageObservation, ...],
+) -> dict[str, tuple[str, ...]]:
+    result = {
+        item.image_id: list()
+        for item in observations
+    }
+    if len(observations) < 2:
+        return {key: tuple(value) for key, value in result.items()}
+    concrete_objects = {
+        item.actual_object
+        for item in observations
+        if item.actual_object != "unknown"
+    }
+    has_identity_signal = (
+        len(concrete_objects) > 1
+        or any(
+            set(item.risk_flags) & {"wrong_object", "claim_mismatch"}
+            for item in observations
+        )
+    )
+    if has_identity_signal:
+        for item in observations:
+            result[item.image_id].append("multi_image_identity_conflict")
+    return {key: tuple(value) for key, value in result.items()}
 
 
 class VisionReviewer:
@@ -598,14 +777,18 @@ class VisionReviewer:
         self,
         client: VisionClient,
         *,
+        review_client: VisionClient | None = None,
         max_attempts: int = 2,
+        review_max_attempts: int | None = None,
         retry_delay_seconds: float = 0.0,
         max_dimension: int = 1600,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         self.client = client
+        self.review_client = review_client
         self.max_attempts = max_attempts
+        self.review_max_attempts = review_max_attempts or max_attempts
         self.retry_delay_seconds = retry_delay_seconds
         self.max_dimension = max_dimension
 
@@ -617,10 +800,35 @@ class VisionReviewer:
         traces: list[dict[str, Any]] = []
         for prepared in prepared_claims:
             observations: list[ImageObservation] = []
+            encoded_images: list[EncodedImage | None] = []
+            case_traces: list[dict[str, Any]] = []
             for image in prepared.claim.images:
-                observation, trace = self.review_image(prepared, image)
+                observation, trace, encoded = self._primary_review(prepared, image)
                 observations.append(observation)
-                traces.append(trace)
+                encoded_images.append(encoded)
+                case_traces.append(trace)
+            primary_observations = tuple(observations)
+            case_reasons = case_escalation_reasons(primary_observations)
+            for index, image in enumerate(prepared.claim.images):
+                reasons = tuple(
+                    dict.fromkeys(
+                        local_escalation_reasons(
+                            primary_observations[index], prepared
+                        )
+                        + case_reasons[image.image_id]
+                    )
+                )
+                if reasons:
+                    observations[index] = self._escalate(
+                        prepared,
+                        image,
+                        encoded_images[index],
+                        primary_observations[index],
+                        reasons,
+                        primary_observations,
+                        case_traces[index],
+                    )
+                traces.append(case_traces[index])
             cases.append(VisualReviewCase(prepared, tuple(observations)))
         return cases, traces
 
@@ -629,11 +837,30 @@ class VisionReviewer:
         prepared: PreparedClaim,
         image: ImageReference,
     ) -> tuple[ImageObservation, dict[str, Any]]:
+        primary, trace, encoded = self._primary_review(prepared, image)
+        reasons = local_escalation_reasons(primary, prepared)
+        if reasons:
+            primary = self._escalate(
+                prepared,
+                image,
+                encoded,
+                primary,
+                reasons,
+                (primary,),
+                trace,
+            )
+        return primary, trace
+
+    def _primary_review(
+        self,
+        prepared: PreparedClaim,
+        image: ImageReference,
+    ) -> tuple[ImageObservation, dict[str, Any], EncodedImage | None]:
         trace: dict[str, Any] = {
             "user_id": prepared.claim.user_id,
             "image_id": image.image_id,
             "path": image.path,
-            "errors": [],
+            "primary": {"errors": []},
         }
         try:
             encoded = encode_image(
@@ -642,20 +869,21 @@ class VisionReviewer:
             trace["image"] = encoded.trace_dict()
         except (DataValidationError, OSError) as exc:
             trace["status"] = "image_read_failed"
-            trace["errors"].append(str(exc))
+            trace["primary"]["errors"].append(str(exc))
             fallback = failed_image_observation(
                 prepared, image, "image_read_failed", attempts=0
             )
-            return fallback, trace
+            return fallback, trace, None
 
         prompt = build_visual_prompt(prepared, image)
+        attempt_prompt = prompt
         schema = image_observation_schema(prepared, image)
         for attempt in range(1, self.max_attempts + 1):
             try:
                 response = self.client.analyze(
-                    prepared, image, encoded, prompt, schema
+                    prepared, image, encoded, attempt_prompt, schema
                 )
-                trace["raw_response"] = response.raw_response
+                trace["primary"]["raw_response"] = response.raw_response
                 observation = parse_image_observation(
                     response.payload,
                     prepared,
@@ -664,8 +892,9 @@ class VisionReviewer:
                     attempts=attempt,
                 )
                 trace["status"] = "completed"
-                trace["attempts"] = attempt
-                return observation, trace
+                trace["primary"]["attempts"] = attempt
+                trace["primary"]["model_name"] = response.model_name
+                return observation, trace, encoded
             except (
                 DataValidationError,
                 OSError,
@@ -673,11 +902,16 @@ class VisionReviewer:
                 ValueError,
                 urllib.error.URLError,
             ) as exc:
-                trace["errors"].append(f"attempt_{attempt}:{exc}")
+                trace["primary"]["errors"].append(f"attempt_{attempt}:{exc}")
+                attempt_prompt = (
+                    prompt
+                    + "\nThe previous response failed local validation. "
+                    + f"Correct this exact issue: {exc}"
+                )
                 if attempt < self.max_attempts and self.retry_delay_seconds:
                     time.sleep(self.retry_delay_seconds)
         trace["status"] = "vlm_failed"
-        trace["attempts"] = self.max_attempts
+        trace["primary"]["attempts"] = self.max_attempts
         return (
             failed_image_observation(
                 prepared,
@@ -686,6 +920,127 @@ class VisionReviewer:
                 attempts=self.max_attempts,
             ),
             trace,
+            encoded,
+        )
+
+    def _escalate(
+        self,
+        prepared: PreparedClaim,
+        image: ImageReference,
+        encoded: EncodedImage | None,
+        primary: ImageObservation,
+        reasons: tuple[str, ...],
+        peer_observations: tuple[ImageObservation, ...],
+        trace: dict[str, Any],
+    ) -> ImageObservation:
+        trace["escalation"] = {
+            "reasons": list(reasons),
+            "errors": [],
+        }
+        if encoded is None or self.review_client is None:
+            diagnostic = (
+                "review_image_unavailable"
+                if encoded is None
+                else "review_client_not_configured"
+            )
+            trace["status"] = "manual_review_required"
+            trace["escalation"]["status"] = diagnostic
+            return _manual_review_observation(
+                primary,
+                EscalationAudit(
+                    reasons=reasons,
+                    status="manual_review_required",
+                    review_model_name=None,
+                    attempts=0,
+                    diagnostics=(diagnostic,),
+                ),
+            )
+
+        prompt = build_review_prompt(
+            prepared, image, primary, reasons, peer_observations
+        )
+        attempt_prompt = prompt
+        schema = image_observation_schema(prepared, image)
+        for attempt in range(1, self.review_max_attempts + 1):
+            try:
+                response = self.review_client.analyze(
+                    prepared, image, encoded, attempt_prompt, schema
+                )
+                trace["escalation"]["raw_response"] = response.raw_response
+                candidate = parse_image_observation(
+                    response.payload,
+                    prepared,
+                    image,
+                    model_name=response.model_name,
+                    attempts=attempt,
+                )
+                conflicts = _critical_conflicts(primary, candidate)
+                unresolved = (
+                    "primary_uncertain_or_unreviewable" in reasons
+                    and "primary_uncertain_or_unreviewable"
+                    in local_escalation_reasons(candidate, prepared)
+                )
+                audit = EscalationAudit(
+                    reasons=reasons,
+                    status=(
+                        "manual_review_required"
+                        if conflicts or unresolved
+                        else "resolved"
+                    ),
+                    review_model_name=response.model_name,
+                    attempts=attempt,
+                    conflicts=conflicts,
+                    diagnostics=(
+                        ("review_remained_uncertain",) if unresolved else ()
+                    ),
+                    review_candidate=candidate.to_dict(),
+                )
+                trace["escalation"].update(
+                    {
+                        "status": audit.status,
+                        "attempts": attempt,
+                        "model_name": response.model_name,
+                        "conflicts": list(conflicts),
+                        "unresolved": unresolved,
+                    }
+                )
+                if conflicts or unresolved:
+                    trace["status"] = "manual_review_required"
+                    return _manual_review_observation(primary, audit)
+                trace["status"] = "completed_after_escalation"
+                return _merge_review_into_unknowns(primary, candidate, audit)
+            except (
+                DataValidationError,
+                OSError,
+                TypeError,
+                ValueError,
+                urllib.error.URLError,
+            ) as exc:
+                trace["escalation"]["errors"].append(
+                    f"attempt_{attempt}:{exc}"
+                )
+                attempt_prompt = (
+                    prompt
+                    + "\nThe previous review response failed local validation. "
+                    + f"Correct this exact issue: {exc}"
+                )
+                if (
+                    attempt < self.review_max_attempts
+                    and self.retry_delay_seconds
+                ):
+                    time.sleep(self.retry_delay_seconds)
+        trace["status"] = "manual_review_required"
+        trace["escalation"]["status"] = "review_failed"
+        trace["escalation"]["attempts"] = self.review_max_attempts
+        return _manual_review_observation(
+            primary,
+            EscalationAudit(
+                reasons=reasons,
+                status="manual_review_required",
+                review_model_name=None,
+                attempts=self.review_max_attempts,
+                diagnostics=("review_failed_after_retries",),
+            ),
         )
 
 
@@ -719,6 +1074,150 @@ def failed_image_observation(
         model_name="fallback",
         attempts=attempts,
         diagnostics=(diagnostic,),
+    )
+
+
+def _critical_conflicts(
+    primary: ImageObservation,
+    candidate: ImageObservation,
+) -> tuple[str, ...]:
+    conflicts: list[str] = []
+    scalar_fields = (
+        ("actual_object", "unknown"),
+        ("severity", "unknown"),
+        ("target_part_visibility", "unknown"),
+    )
+    for field_name, unknown in scalar_fields:
+        primary_value = getattr(primary, field_name)
+        candidate_value = getattr(candidate, field_name)
+        if (
+            primary_value != unknown
+            and candidate_value != unknown
+            and primary_value != candidate_value
+        ):
+            conflicts.append(field_name)
+    for field_name in ("visible_parts", "visible_issue_types"):
+        primary_value = getattr(primary, field_name)
+        candidate_value = getattr(candidate, field_name)
+        if (
+            primary_value not in {("unknown",)}
+            and candidate_value not in {("unknown",)}
+            and primary_value != candidate_value
+        ):
+            conflicts.append(field_name)
+    primary_requirements = {
+        item.requirement_id: item.status
+        for item in primary.requirement_results
+    }
+    for item in candidate.requirement_results:
+        primary_status = primary_requirements[item.requirement_id]
+        if (
+            primary_status != "unknown"
+            and item.status != "unknown"
+            and primary_status != item.status
+        ):
+            conflicts.append(f"requirement:{item.requirement_id}")
+    removed_high_risks = (
+        set(primary.risk_flags) & HIGH_RISK_FLAGS
+    ) - set(candidate.risk_flags)
+    conflicts.extend(f"risk:{item}" for item in sorted(removed_high_risks))
+    return tuple(conflicts)
+
+
+def _merge_review_into_unknowns(
+    primary: ImageObservation,
+    candidate: ImageObservation,
+    audit: EscalationAudit,
+) -> ImageObservation:
+    requirement_candidates = {
+        item.requirement_id: item for item in candidate.requirement_results
+    }
+    merged_requirements = tuple(
+        (
+            requirement_candidates[item.requirement_id]
+            if item.status == "unknown"
+            else item
+        )
+        for item in primary.requirement_results
+    )
+    primary_risks = set(primary.risk_flags) - {"none"}
+    if primary.model_name == "fallback":
+        primary_risks.discard("manual_review_required")
+    candidate_risks = set(candidate.risk_flags) - {"none"}
+    merged_risks = tuple(sorted(primary_risks | candidate_risks)) or ("none",)
+    primary_was_fallback = primary.model_name == "fallback"
+    return replace(
+        primary,
+        actual_object=(
+            candidate.actual_object
+            if primary.actual_object == "unknown"
+            else primary.actual_object
+        ),
+        visible_parts=(
+            candidate.visible_parts
+            if primary.visible_parts == ("unknown",)
+            else primary.visible_parts
+        ),
+        visible_issue_types=(
+            candidate.visible_issue_types
+            if primary.visible_issue_types == ("unknown",)
+            else primary.visible_issue_types
+        ),
+        severity=(
+            candidate.severity
+            if primary.severity == "unknown"
+            else primary.severity
+        ),
+        target_part_visibility=(
+            candidate.target_part_visibility
+            if primary.target_part_visibility == "unknown"
+            else primary.target_part_visibility
+        ),
+        requirement_results=merged_requirements,
+        fact_summary=(
+            candidate.fact_summary
+            if primary_was_fallback
+            else primary.fact_summary
+        ),
+        risk_flags=merged_risks,
+        reviewable=(
+            candidate.reviewable if not primary.reviewable else primary.reviewable
+        ),
+        claim_target_clear=(
+            candidate.claim_target_clear
+            if not primary.claim_target_clear
+            else primary.claim_target_clear
+        ),
+        model_name=(
+            candidate.model_name if primary_was_fallback else primary.model_name
+        ),
+        attempts=primary.attempts + candidate.attempts,
+        diagnostics=tuple(
+            dict.fromkeys(primary.diagnostics + candidate.diagnostics)
+        ),
+        escalation=audit,
+    )
+
+
+def _manual_review_observation(
+    primary: ImageObservation,
+    audit: EscalationAudit,
+) -> ImageObservation:
+    risks = tuple(
+        sorted((set(primary.risk_flags) - {"none"}) | {"manual_review_required"})
+    )
+    return replace(
+        primary,
+        risk_flags=risks,
+        reviewable=False,
+        diagnostics=tuple(
+            dict.fromkeys(
+                primary.diagnostics
+                + audit.diagnostics
+                + ("manual_review_required",)
+            )
+        ),
+        escalation=audit,
     )
 
 

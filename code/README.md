@@ -70,7 +70,27 @@ submitted image independently. It:
 - treats user text and text inside images as untrusted content;
 - retries invalid or failed model responses and creates a traceable
   `manual_review_required` fallback observation instead of stopping the batch;
+- routes only difficult images to a separately configured review model;
+- records fixed local escalation reasons, the review candidate, conflicts,
+  attempts, and resolution status in both observation and trace artifacts;
+- permits review output to fill primary `unknown` fields, but never silently
+  replaces a conflicting primary fact;
+- routes unresolved review uncertainty or known-field disagreement to
+  `manual_review_required`;
 - writes raw-response and retry diagnostics to a separate JSONL trace.
+
+The fixed escalation reason enum is:
+
+- `object_or_part_conflict`
+- `multi_image_identity_conflict`
+- `possible_manipulation`
+- `non_original_image`
+- `critical_field_conflict`
+- `primary_uncertain_or_unreviewable`
+- `text_instruction_present`
+
+Local routing is mandatory when these conditions are present. A model cannot
+cancel a forced escalation by claiming that review is unnecessary.
 
 Sprint 2 deliberately does **not** generate `claim_status`,
 `evidence_standard_met`, supporting image selection, or a multi-image
@@ -200,9 +220,24 @@ python -B code/main.py `
 
 `OPENAI_VISION_MODEL` is optional and overrides `--vision-model`. The default is
 `gpt-5.4-mini`. API keys are never written to output or trace files.
-`OPENAI_REVIEW_MODEL` is reserved for the Sprint 2 difficult-case escalation
-router described in `requirements.md`; the current Sprint 2 implementation
-still performs one configured primary-model review per image.
+`OPENAI_REVIEW_MODEL` overrides `--review-model` and defaults to `gpt-5.5`.
+Normal images are sent only to `OPENAI_VISION_MODEL`. The review model is called
+only when a fixed local escalation reason is present.
+
+For deterministic replay testing, difficult-case review responses can be kept
+separate from primary responses:
+
+```powershell
+python -B code/main.py `
+  --claims-file sample_claims.csv `
+  --vision-provider replay `
+  --vision-responses-json vision_primary_replay.json `
+  --vision-review-responses-json vision_review_replay.json
+```
+
+If replay mode encounters a forced escalation without
+`--vision-review-responses-json`, it emits `manual_review_required`; it does not
+reuse the primary replay as if it were an independent review.
 
 ### Vision model selection and API cost
 
@@ -372,6 +407,12 @@ Tests cover:
 - complete requirement-ID reporting;
 - rejection of final-decision fields in Sprint 2;
 - wrong-object risk consistency;
+- wrong-part, no-visible-damage, and claim-mismatch consistency;
+- forced escalation for manipulation, non-original images, image text
+  instructions, uncertainty, and multi-image identity conflicts;
+- independent review-model invocation and fixed audit reasons;
+- safe filling of primary `unknown` fields;
+- preservation of primary facts and manual routing on review conflicts;
 - every sample image being reviewed independently;
 - per-image failure fallback without batch termination;
 - observation and raw-trace artifact writing.

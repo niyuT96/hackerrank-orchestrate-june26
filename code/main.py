@@ -40,6 +40,7 @@ DEFAULT_VISUAL_TRACES = REPO_ROOT / "sprint2_trace.jsonl"
 DEFAULT_ENV_FILE = REPO_ROOT / ".env"
 DEFAULT_CLAIM_MODEL = "gpt-5.4-mini"
 DEFAULT_VISION_MODEL = "gpt-5.4-mini"
+DEFAULT_REVIEW_MODEL = "gpt-5.5"
 
 
 def load_environment(env_file: Path = DEFAULT_ENV_FILE) -> bool:
@@ -125,6 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Replay VLM responses keyed by image path or user_id:image_id.",
     )
     parser.add_argument(
+        "--vision-review-responses-json",
+        type=Path,
+        help=(
+            "Optional replay responses for difficult-case escalation. "
+            "If omitted in replay mode, forced escalations go to manual review."
+        ),
+    )
+    parser.add_argument(
         "--vision-output",
         type=Path,
         default=DEFAULT_VISUAL_REVIEWS,
@@ -142,12 +151,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="OpenAI vision-capable model; override with OPENAI_VISION_MODEL.",
     )
     parser.add_argument(
+        "--review-model",
+        default=DEFAULT_REVIEW_MODEL,
+        help=(
+            "OpenAI difficult-case review model; override with "
+            "OPENAI_REVIEW_MODEL."
+        ),
+    )
+    parser.add_argument(
         "--vision-timeout",
         type=float,
         default=60.0,
     )
     parser.add_argument(
         "--vision-max-attempts",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--review-max-attempts",
         type=int,
         default=2,
     )
@@ -215,15 +237,31 @@ def _vision_reviewer(args: argparse.Namespace) -> VisionReviewer | None:
         client = ReplayVisionClient(
             load_replay_responses(args.vision_responses_json)
         )
+        review_client = (
+            ReplayVisionClient(
+                load_replay_responses(args.vision_review_responses_json)
+            )
+            if args.vision_review_responses_json
+            else None
+        )
     else:
         model = os.environ.get("OPENAI_VISION_MODEL") or args.vision_model
         client = OpenAIResponsesVisionClient(
             model=model,
             timeout_seconds=args.vision_timeout,
         )
+        review_model = (
+            os.environ.get("OPENAI_REVIEW_MODEL") or args.review_model
+        )
+        review_client = OpenAIResponsesVisionClient(
+            model=review_model,
+            timeout_seconds=args.vision_timeout,
+        )
     return VisionReviewer(
         client,
+        review_client=review_client,
         max_attempts=args.vision_max_attempts,
+        review_max_attempts=args.review_max_attempts,
         retry_delay_seconds=args.vision_retry_delay,
         max_dimension=args.vision_max_dimension,
     )

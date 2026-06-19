@@ -15,11 +15,18 @@ if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
 from claim_agent import DataValidationError, load_bundle  # noqa: E402
-from main import DEFAULT_VISION_MODEL, load_environment  # noqa: E402
+from main import (  # noqa: E402
+    DEFAULT_REVIEW_MODEL,
+    DEFAULT_VISION_MODEL,
+    load_environment,
+)
 from visual_agent import (  # noqa: E402
+    ESCALATION_REASONS,
     ReplayVisionClient,
     VisionReviewer,
     encode_image,
+    image_observation_schema,
+    local_escalation_reasons,
     parse_image_observation,
     write_visual_reviews,
     write_visual_traces,
@@ -32,7 +39,8 @@ class EnvironmentConfigurationTests(unittest.TestCase):
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
                 "OPENAI_API_KEY=dotenv-key\n"
-                "OPENAI_VISION_MODEL=gpt-5.5\n",
+                "OPENAI_VISION_MODEL=gpt-5.5\n"
+                "OPENAI_REVIEW_MODEL=gpt-5.5-pro\n",
                 encoding="utf-8",
             )
             with mock.patch.dict(
@@ -43,9 +51,13 @@ class EnvironmentConfigurationTests(unittest.TestCase):
                 self.assertTrue(load_environment(env_path))
                 self.assertEqual(os.environ["OPENAI_API_KEY"], "process-key")
                 self.assertEqual(os.environ["OPENAI_VISION_MODEL"], "gpt-5.5")
+                self.assertEqual(
+                    os.environ["OPENAI_REVIEW_MODEL"], "gpt-5.5-pro"
+                )
 
     def test_default_vision_model_is_current_cost_quality_choice(self) -> None:
         self.assertEqual(DEFAULT_VISION_MODEL, "gpt-5.4-mini")
+        self.assertEqual(DEFAULT_REVIEW_MODEL, "gpt-5.5")
 
 
 def valid_payload(prepared, image):
@@ -57,26 +69,36 @@ def valid_payload(prepared, image):
         ),
         "unknown",
     )
+    issue = next(
+        (
+            value
+            for value in prepared.parsed_claim.claimed_issue_types
+            if value not in {"unknown", "none"}
+        ),
+        "none",
+    )
     return {
         "image_id": image.image_id,
         "path": image.path,
         "actual_object": prepared.claim.claim_object,
         "visible_parts": [part],
-        "visible_issue_types": ["unknown"],
-        "severity": "unknown",
+        "visible_issue_types": [issue],
+        "severity": "medium" if issue != "none" else "none",
         "target_part_visibility": (
             "visible" if part != "unknown" else "unknown"
         ),
         "requirement_results": [
             {
                 "requirement_id": requirement.requirement_id,
-                "status": "unknown",
-                "reason": "The image requires visual review.",
+                "status": "met",
+                "reason": "The required target and issue are visible.",
             }
             for requirement in prepared.requirements
         ],
         "fact_summary": "The claimed object and target area are visible.",
-        "risk_flags": ["none"],
+        "risk_flags": (
+            ["none"] if issue != "none" else ["damage_not_visible"]
+        ),
         "reviewable": True,
         "claim_target_clear": part != "unknown",
         "diagnostics": [],
@@ -129,6 +151,10 @@ class ObservationValidationTests(unittest.TestCase):
         self.assertEqual(observation.image_id, self.image.image_id)
         self.assertNotIn("claim_status", observation.to_dict())
 
+    def test_openai_schema_avoids_unsupported_unique_items_keyword(self) -> None:
+        schema = image_observation_schema(self.prepared, self.image)
+        self.assertNotIn("uniqueItems", json.dumps(schema))
+
     def test_rejects_invented_requirement_id(self) -> None:
         payload = valid_payload(self.prepared, self.image)
         payload["requirement_results"][0]["requirement_id"] = "REQ_INVENTED"
@@ -166,6 +192,68 @@ class ObservationValidationTests(unittest.TestCase):
                 model_name="test",
                 attempts=1,
             )
+
+    def test_wrong_object_part_requires_risk_flag(self) -> None:
+        payload = valid_payload(self.prepared, self.image)
+        payload["visible_parts"] = ["front_bumper"]
+        payload["target_part_visibility"] = "not_visible"
+        with self.assertRaisesRegex(DataValidationError, "wrong_object_part"):
+            parse_image_observation(
+                payload,
+                self.prepared,
+                self.image,
+                model_name="test",
+                attempts=1,
+            )
+
+    def test_no_visible_damage_requires_damage_not_visible_risk(self) -> None:
+        payload = valid_payload(self.prepared, self.image)
+        payload["visible_issue_types"] = ["none"]
+        payload["severity"] = "none"
+        payload["risk_flags"] = ["none"]
+        with self.assertRaisesRegex(DataValidationError, "damage_not_visible"):
+            parse_image_observation(
+                payload,
+                self.prepared,
+                self.image,
+                model_name="test",
+                attempts=1,
+            )
+
+    def test_conflicting_visible_issue_requires_claim_mismatch_risk(self) -> None:
+        payload = valid_payload(self.prepared, self.image)
+        payload["visible_issue_types"] = ["scratch"]
+        with self.assertRaisesRegex(DataValidationError, "claim_mismatch"):
+            parse_image_observation(
+                payload,
+                self.prepared,
+                self.image,
+                model_name="test",
+                attempts=1,
+            )
+
+    def test_high_risk_flags_have_fixed_escalation_reasons(self) -> None:
+        expected = {
+            "possible_manipulation": "possible_manipulation",
+            "non_original_image": "non_original_image",
+            "text_instruction_present": "text_instruction_present",
+        }
+        for risk, reason in expected.items():
+            with self.subTest(risk=risk):
+                payload = valid_payload(self.prepared, self.image)
+                payload["risk_flags"] = [risk]
+                observation = parse_image_observation(
+                    payload,
+                    self.prepared,
+                    self.image,
+                    model_name="test",
+                    attempts=1,
+                )
+                reasons = local_escalation_reasons(
+                    observation, self.prepared
+                )
+                self.assertIn(reason, reasons)
+                self.assertTrue(set(reasons) <= ESCALATION_REASONS)
 
 
 class VisionPipelineTests(unittest.TestCase):
@@ -238,6 +326,158 @@ class VisionPipelineTests(unittest.TestCase):
         self.assertFalse(observations[0].reviewable)
         self.assertEqual(observations[0].model_name, "fallback")
         self.assertTrue(any(item["status"] == "completed" for item in traces))
+
+    def test_forced_escalation_calls_review_client_and_records_audit(self) -> None:
+        prepared = self.prepared[0]
+        image = prepared.claim.images[0]
+        primary_payload = valid_payload(prepared, image)
+        primary_payload["risk_flags"] = ["possible_manipulation"]
+        review_payload = dict(primary_payload)
+        reviewer = VisionReviewer(
+            ReplayVisionClient({image.path: primary_payload}),
+            review_client=ReplayVisionClient({image.path: review_payload}),
+            max_attempts=1,
+            review_max_attempts=1,
+            max_dimension=512,
+        )
+        observation, trace = reviewer.review_image(prepared, image)
+        self.assertEqual(observation.escalation.status, "resolved")
+        self.assertEqual(
+            observation.escalation.reasons, ("possible_manipulation",)
+        )
+        self.assertEqual(trace["status"], "completed_after_escalation")
+
+    def test_review_conflict_preserves_primary_and_routes_to_human(self) -> None:
+        prepared = self.prepared[0]
+        image = prepared.claim.images[0]
+        primary_payload = valid_payload(prepared, image)
+        primary_payload["risk_flags"] = ["possible_manipulation"]
+        review_payload = valid_payload(prepared, image)
+        review_payload["visible_issue_types"] = ["scratch"]
+        review_payload["risk_flags"] = [
+            "possible_manipulation",
+            "claim_mismatch",
+        ]
+        reviewer = VisionReviewer(
+            ReplayVisionClient({image.path: primary_payload}),
+            review_client=ReplayVisionClient({image.path: review_payload}),
+            max_attempts=1,
+            review_max_attempts=1,
+            max_dimension=512,
+        )
+        observation, trace = reviewer.review_image(prepared, image)
+        self.assertEqual(observation.visible_issue_types, ("dent",))
+        self.assertIn("manual_review_required", observation.risk_flags)
+        self.assertIn(
+            "visible_issue_types", observation.escalation.conflicts
+        )
+        self.assertEqual(trace["status"], "manual_review_required")
+
+    def test_missing_review_client_routes_forced_escalation_to_human(self) -> None:
+        prepared = self.prepared[0]
+        image = prepared.claim.images[0]
+        payload = valid_payload(prepared, image)
+        payload["risk_flags"] = ["non_original_image"]
+        reviewer = VisionReviewer(
+            ReplayVisionClient({image.path: payload}),
+            max_attempts=1,
+            max_dimension=512,
+        )
+        observation, trace = reviewer.review_image(prepared, image)
+        self.assertIn("manual_review_required", observation.risk_flags)
+        self.assertEqual(
+            observation.escalation.diagnostics,
+            ("review_client_not_configured",),
+        )
+        self.assertEqual(trace["status"], "manual_review_required")
+
+    def test_review_can_fill_unknown_primary_fields_without_overwriting_facts(
+        self,
+    ) -> None:
+        prepared = self.prepared[0]
+        image = prepared.claim.images[0]
+        primary_payload = valid_payload(prepared, image)
+        primary_payload.update(
+            {
+                "actual_object": "unknown",
+                "visible_parts": ["unknown"],
+                "visible_issue_types": ["unknown"],
+                "severity": "unknown",
+                "target_part_visibility": "unknown",
+                "requirement_results": [
+                    {
+                        "requirement_id": requirement.requirement_id,
+                        "status": "unknown",
+                        "reason": "The primary model could not determine this.",
+                    }
+                    for requirement in prepared.requirements
+                ],
+                "fact_summary": "The primary result is uncertain.",
+                "reviewable": False,
+                "claim_target_clear": False,
+            }
+        )
+        review_payload = valid_payload(prepared, image)
+        reviewer = VisionReviewer(
+            ReplayVisionClient({image.path: primary_payload}),
+            review_client=ReplayVisionClient({image.path: review_payload}),
+            max_attempts=1,
+            review_max_attempts=1,
+            max_dimension=512,
+        )
+        observation, trace = reviewer.review_image(prepared, image)
+        self.assertEqual(observation.actual_object, "car")
+        self.assertEqual(observation.visible_issue_types, ("dent",))
+        self.assertTrue(observation.reviewable)
+        self.assertEqual(observation.escalation.status, "resolved")
+        self.assertEqual(trace["status"], "completed_after_escalation")
+
+    def test_successful_review_clears_fallback_manual_marker(self) -> None:
+        prepared = self.prepared[0]
+        image = prepared.claim.images[0]
+        review_payload = valid_payload(prepared, image)
+        reviewer = VisionReviewer(
+            ReplayVisionClient({}),
+            review_client=ReplayVisionClient({image.path: review_payload}),
+            max_attempts=1,
+            review_max_attempts=1,
+            max_dimension=512,
+        )
+        observation, trace = reviewer.review_image(prepared, image)
+        self.assertNotIn("manual_review_required", observation.risk_flags)
+        self.assertEqual(observation.model_name, "replay")
+        self.assertTrue(observation.reviewable)
+        self.assertEqual(trace["status"], "completed_after_escalation")
+
+    def test_multi_image_identity_signal_escalates_each_related_image(self) -> None:
+        prepared = self.prepared[1]
+        primary_responses = {}
+        review_responses = {}
+        for image in prepared.claim.images:
+            payload = valid_payload(prepared, image)
+            if image.image_id == "img_2":
+                payload["risk_flags"] = ["claim_mismatch"]
+            primary_responses[image.path] = payload
+            review_responses[image.path] = payload
+        reviewer = VisionReviewer(
+            ReplayVisionClient(primary_responses),
+            review_client=ReplayVisionClient(review_responses),
+            max_attempts=1,
+            review_max_attempts=1,
+            max_dimension=512,
+        )
+        cases, traces = reviewer.review([prepared])
+        observations = cases[0].observations
+        self.assertTrue(
+            all(
+                "multi_image_identity_conflict"
+                in item.escalation.reasons
+                for item in observations
+            )
+        )
+        self.assertTrue(
+            all("escalation" in item for item in traces)
+        )
 
 
 if __name__ == "__main__":
