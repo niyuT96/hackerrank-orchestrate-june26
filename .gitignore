@@ -4,3 +4,4 @@
 !code/claim_lexicon.json
 *.pyc
 .env
+requirements.md

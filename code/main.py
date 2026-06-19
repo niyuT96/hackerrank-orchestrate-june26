@@ -28,6 +28,7 @@ from visual_agent import (
     write_visual_reviews,
     write_visual_traces,
 )
+from decision_agent import write_final_output
 
 
 CODE_DIR = Path(__file__).resolve().parent
@@ -37,6 +38,7 @@ DEFAULT_OUTPUT = REPO_ROOT / "sprint1_output.csv"
 DEFAULT_PREPARED = REPO_ROOT / "sprint1_summary.json"
 DEFAULT_VISUAL_REVIEWS = REPO_ROOT / "sprint2_observations.json"
 DEFAULT_VISUAL_TRACES = REPO_ROOT / "sprint2_trace.jsonl"
+DEFAULT_FINAL_OUTPUT = REPO_ROOT / "output.csv"
 DEFAULT_ENV_FILE = REPO_ROOT / ".env"
 DEFAULT_CLAIM_MODEL = "gpt-5.4-mini"
 DEFAULT_VISION_MODEL = "gpt-5.4-mini"
@@ -183,6 +185,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1600,
     )
+    parser.add_argument(
+        "--final-output",
+        type=Path,
+        default=DEFAULT_FINAL_OUTPUT,
+        help=(
+            "Sprint 3 final output.csv path. Written only when --vision-provider "
+            "is not 'none'."
+        ),
+    )
     return parser
 
 
@@ -301,6 +312,16 @@ def run(args: argparse.Namespace) -> int:
         )
         if case_count != prepared_count or trace_count != expected_images:
             return 4
+
+        # Sprint 3: deterministic aggregation → final output.csv
+        final_count = write_final_output(cases, args.final_output.resolve())
+        print(
+            f"Sprint 3 aggregation complete; wrote {final_count} decisions to "
+            f"{args.final_output.resolve()}"
+        )
+        if final_count != prepared_count:
+            return 5
+
     return 0
 
 

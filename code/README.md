@@ -96,6 +96,48 @@ Sprint 2 deliberately does **not** generate `claim_status`,
 `evidence_standard_met`, supporting image selection, or a multi-image
 decision. Those belong to Sprint 3.
 
+## Sprint 3 scope
+
+Sprint 3 is the deterministic aggregation and decision layer. It consumes the
+per-image `VisualReviewCase` records produced by Sprint 2 and generates all
+ten output fields. It runs immediately after Sprint 2 in the same pipeline
+call. It:
+
+- unions per-image risk flags and adds `user_history_risk` or
+  `manual_review_required` from the claim history, but never uses history
+  alone to override a clear visual conclusion;
+- determines `valid_image`: `true` unless all images are non-reviewable or the
+  entire set has authenticity issues;
+- selects the single most informative image observation for visual-fact
+  extraction based on reviewability, target-part visibility, and damage
+  alignment;
+- derives `issue_type`, `object_part`, and `severity` from the best
+  observation's visible facts;
+- evaluates `evidence_standard_met` by checking each matched requirement
+  against the best per-image status across all reviewable observations; a
+  multi-image identity conflict (different objects across images) overrides
+  `evidence_standard_met=false` even if individual requirements appear met;
+- applies the three-state decision logic:
+  - `not_enough_information` when evidence is insufficient, or the target
+    part is not visible, or the claim is too broad to verify;
+  - `contradicted` when the target is visible but shows no damage, when the
+    wrong object is shown, or when visible damage type mismatches the claim;
+  - `supported` when the claimed part and damage type are both visible;
+- user claim `unknown` parts or issues are never auto-expanded to a more
+  specific supported conclusion;
+- `claimed_severity="unknown"` does not affect the damage-existence decision;
+  the final `severity` always comes from visual facts;
+- selects `supporting_image_ids` traceable to `ImageObservation` records:
+  only the images that materially contribute to the conclusion are listed;
+  `none` is written when no image supports the conclusion;
+- enforces cross-field invariants (`issue_type=none ↔ severity=none`,
+  `object_part` in allowed enum for `claim_object`, all output enums legal)
+  and calls `ReviewResult.validate()` before writing;
+- writes the final `output.csv` with all 14 columns in the required order.
+
+The aggregation entry point is `aggregate_visual_case(case) -> ReviewResult`
+in `decision_agent.py`. The writer is `write_final_output(cases, path)`.
+
 ## Requirements
 
 - Python 3.11 or later
@@ -205,6 +247,33 @@ python -B code/main.py `
   --claim-routing always `
   --llm-responses-json parser_responses.json
 ```
+
+## Run Sprint 3
+
+Sprint 3 runs automatically whenever `--vision-provider` is not `none`. After
+Sprint 2 writes `sprint2_observations.json` and `sprint2_trace.jsonl`, Sprint
+3 aggregates each `VisualReviewCase` and writes the final decision output:
+
+```powershell
+python -B code/main.py `
+  --claims-file sample_claims.csv `
+  --vision-provider openai `
+  --final-output output.csv
+```
+
+For offline replay:
+
+```powershell
+python -B code/main.py `
+  --claims-file sample_claims.csv `
+  --vision-provider replay `
+  --vision-responses-json vision_replay.json `
+  --final-output output.csv
+```
+
+The `--final-output` flag defaults to `output.csv` in the repository root.
+The Sprint 1 placeholder `sprint1_output.csv` is still written for
+diagnostics and must not be submitted as the final prediction.
 
 ## Run Sprint 2
 
@@ -416,6 +485,17 @@ Tests cover:
 - every sample image being reviewed independently;
 - per-image failure fallback without batch termination;
 - observation and raw-trace artifact writing.
+- history risk flag generation and isolation from visual decisions;
+- evidence standard evaluation across single and multi-image cases;
+- multi-image identity conflict override of evidence standard;
+- three-state decision: supported, contradicted, not_enough_information;
+- user history risk added to flags without changing clear visual conclusions;
+- multi-image blurry+clear → supported using the clearer image only;
+- wrong-object multi-image → not_enough_information with identity conflict;
+- issue_type=none ↔ severity=none invariant enforcement;
+- supporting_image_ids traceable to ImageObservation records;
+- write_final_output: 14-column schema, correct row count, enum legality,
+  input column preservation, boolean serialization, and none sentinel.
 
 ## Main modules
 
@@ -423,5 +503,8 @@ Tests cover:
 - `claim_agent.py`: models, parsers, selector, loaders, rule matcher, and writers
 - `visual_agent.py`: image processing, VLM clients, observation validation,
   retry/fallback handling, and Sprint 2 writers
+- `decision_agent.py`: Sprint 3 deterministic aggregation, evidence judgment,
+  three-state decision, and final output writer
 - `tests/test_claim_agent.py`: Sprint 1 automated tests
 - `tests/test_visual_agent.py`: Sprint 2 automated tests
+- `tests/test_decision_agent.py`: Sprint 3 automated tests
