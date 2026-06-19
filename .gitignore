@@ -1,0 +1,5 @@
+*_cache
+*.csv
+*.json
+*.pyc
+.env
