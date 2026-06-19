@@ -13,12 +13,24 @@ Sprint 1 prepares each raw claim for a later visual agent. It:
   `image_id`;
 - extracts claimed parts, issue types, severity, excluded parts, and source
   quotes;
+- parses the original multilingual or code-switched conversation directly
+  instead of translating it into an intermediate English claim;
+- gives the last meaningful customer confirmation priority over earlier
+  speculation and keeps explicit scope exclusions separate;
+- treats generic words such as `damaged`, `mark`, and `issue` as insufficient
+  to infer a specific damage enum;
 - keeps a deterministic rule parser as the baseline and fallback;
 - supports an optional structured LLM parser through a provider-neutral
   adapter;
 - validates parser enums, object-specific parts, confidence, and evidence
   quotes locally;
-- records rule/LLM disagreements without merging their outputs;
+- requires independent exact-source evidence for every included part, excluded
+  part, specific issue type, and claimed severity; excluded-part evidence must
+  include the negation or exclusion wording;
+- rejects LLM-specific damage enums when their only textual basis is a generic
+  term such as `damaged`, `mark`, or `issue`;
+- records rule/LLM differences for all parser fields, including scope,
+  provenance quotes, confidence, and diagnostics, without merging outputs;
 - matches only valid requirements from `evidence_requirements.csv`;
 - stores both requirement IDs and full minimum-evidence text;
 - writes a complete `PreparedClaim` JSON handoff for Sprint 2;
@@ -29,10 +41,44 @@ remain `unknown` or `false`, and every status is
 `not_enough_information`. Do not submit `sprint1_output.csv` as the final
 competition output.
 
+## Sprint 2 scope
+
+Sprint 2 consumes the in-memory `PreparedClaim` records and reviews every
+submitted image independently. It:
+
+- reads and validates each local image;
+- decodes ordinary Pillow formats and AVIF content even when the supplied file
+  uses a `.jpg` extension;
+- applies EXIF orientation, bounds the longest edge, and JPEG-encodes the
+  processed image;
+- sends one image, the untrusted claim target, and all matched minimum
+  evidence requirements to a provider-neutral vision client;
+- supports OpenAI Responses API image input and deterministic replay JSON;
+- requires one structured `ImageObservation` per image;
+- records actual object, visible parts, visible damage, visual severity,
+  target-part visibility, quality/authenticity risks, and requirement results;
+- rejects invented image IDs, paths, requirement IDs, enum values, and
+  additional fields;
+- treats user text and text inside images as untrusted content;
+- retries invalid or failed model responses and creates a traceable
+  `manual_review_required` fallback observation instead of stopping the batch;
+- writes raw-response and retry diagnostics to a separate JSONL trace.
+
+Sprint 2 deliberately does **not** generate `claim_status`,
+`evidence_standard_met`, supporting image selection, or a multi-image
+decision. Those belong to Sprint 3.
+
 ## Requirements
 
 - Python 3.11 or later
-- No third-party packages for the deterministic Sprint 1 pipeline
+- Pillow, pillow-avif-plugin, and python-dotenv, declared in `requirements.txt`
+- `OPENAI_API_KEY` only when using the OpenAI vision provider
+
+Install:
+
+```powershell
+python -m pip install -r code/requirements.txt
+```
 
 ## Run
 
@@ -68,23 +114,194 @@ python -B code/main.py `
 
 `--summary-json` remains an alias for `--prepared-json`.
 
-## Parser architecture
+## Configure OpenAI
 
-`RuleBasedClaimParser` always runs. An optional `LLMClaimParser` can run in
-parallel and must return the same structured schema. The local selector:
-
-1. validates both results;
-2. accepts agreement directly;
-3. records field-level disagreement;
-4. selects a validated, sufficiently confident LLM result;
-5. falls back to the rule parser when the LLM result is invalid or unavailable.
-
-The repository does not hard-code an LLM provider. `LLMClaimParser` accepts an
-injected client callable. For offline testing and reproducible replay, the CLI
-accepts a JSON object keyed by `user_id`:
+Create a local `.env` file from the safe template:
 
 ```powershell
-python -B code/main.py --llm-responses-json parser_responses.json
+Copy-Item .env.example .env
+```
+
+Then edit `.env`:
+
+```dotenv
+OPENAI_API_KEY=replace_with_your_openai_api_key
+OPENAI_CLAIM_MODEL=gpt-5.4-mini
+OPENAI_VISION_MODEL=gpt-5.4-mini
+OPENAI_REVIEW_MODEL=gpt-5.5
+```
+
+The CLI automatically loads `.env` from the repository root. Existing process
+environment variables take precedence, so production or CI configuration is
+never overwritten by the local file. `.env` is excluded by `.gitignore`;
+`.env.example` contains no secret and should remain committed.
+
+## Run Sprint 1 with the Claim API
+
+The rule parser always runs. When a Claim provider is configured, the default
+`--claim-routing always` mode also runs `LLMClaimParser` for every claim,
+retains both results, records field-level differences, and lets the local
+selector choose the validated result:
+
+```powershell
+python -B code/main.py `
+  --claims-file sample_claims.csv `
+  --claim-provider openai `
+  --prepared-json sample_sprint1_summary.json
+```
+
+`OPENAI_CLAIM_MODEL` overrides `--claim-model`; the default is
+`gpt-5.4-mini`.
+
+`--claim-routing auto` is an explicit cost-optimization experiment. It calls
+the LLM only for unknown or low-confidence rule results, multiple parts,
+multilingual/code-switched text, or complex negation/final scope. It is not the
+Sprint 1 baseline behavior.
+
+The online client uses Responses API Structured Outputs. Every result is still
+checked locally for allowed fields, enums, object-specific parts, exact
+per-field source quotes, negated evidence for excluded parts, include/exclude
+overlap, generic-term overreach, and confidence. Invalid responses are retried
+and then fall back to the deterministic parser.
+
+For offline replay:
+
+```powershell
+python -B code/main.py `
+  --claims-file sample_claims.csv `
+  --claim-provider replay `
+  --claim-routing always `
+  --llm-responses-json parser_responses.json
+```
+
+## Run Sprint 2
+
+Using the OpenAI Responses API:
+
+```powershell
+python -B code/main.py `
+  --claims-file sample_claims.csv `
+  --vision-provider openai `
+  --vision-output sample_sprint2_observations.json `
+  --vision-trace sample_sprint2_trace.jsonl
+```
+
+`OPENAI_VISION_MODEL` is optional and overrides `--vision-model`. The default is
+`gpt-5.4-mini`. API keys are never written to output or trace files.
+`OPENAI_REVIEW_MODEL` is reserved for the Sprint 2 difficult-case escalation
+router described in `requirements.md`; the current Sprint 2 implementation
+still performs one configured primary-model review per image.
+
+### Vision model selection and API cost
+
+Prices below are OpenAI standard API token prices as of June 19, 2026 and
+should be rechecked before a production run:
+
+| Model | Recommended use | Input / output price per 1M tokens |
+|---|---|---:|
+| `gpt-5.4-mini` | Default. Strong cost/quality balance for per-image structured extraction. | $0.75 / $4.50 |
+| `gpt-5.5` | Accuracy-focused evaluation or difficult/ambiguous images. | $5.00 / $30.00 |
+| `gpt-5.4-nano` | Cheap first pass or simple quality/object classification; benchmark before using for final damage decisions. | $0.20 / $1.25 |
+
+All three accept image input and text output through the Responses API and
+support structured outputs. Image inputs are converted to billable input
+tokens based on image dimensions and model-specific tokenization. Therefore,
+the exact run cost depends on the number and dimensions of images, prompt
+length, retries, reasoning tokens, and JSON output length.
+
+Official references:
+
+- Models: https://developers.openai.com/api/docs/models
+- Structured Outputs: https://developers.openai.com/api/docs/guides/structured-outputs
+- GPT-5.4 mini: https://developers.openai.com/api/docs/models/gpt-5.4-mini
+- GPT-5.5: https://developers.openai.com/api/docs/models/gpt-5.5
+- GPT-5.4 nano: https://developers.openai.com/api/docs/models/gpt-5.4-nano
+- Vision token calculation: https://developers.openai.com/api/docs/guides/images-vision#calculating-costs
+- Pricing: https://developers.openai.com/api/docs/pricing
+
+For deterministic offline testing, provide one structured response per image,
+keyed by its dataset-relative path:
+
+```powershell
+python -B code/main.py `
+  --claims-file sample_claims.csv `
+  --vision-provider replay `
+  --vision-responses-json vision_replay.json `
+  --vision-output sample_sprint2_observations.json `
+  --vision-trace sample_sprint2_trace.jsonl
+```
+
+Example replay key:
+
+```json
+{
+  "images/sample/case_001/img_1.jpg": {
+    "image_id": "img_1",
+    "path": "images/sample/case_001/img_1.jpg",
+    "actual_object": "car",
+    "visible_parts": ["rear_bumper"],
+    "visible_issue_types": ["dent"],
+    "severity": "medium",
+    "target_part_visibility": "visible",
+    "requirement_results": [
+      {
+        "requirement_id": "REQ_GENERAL_OBJECT_PART",
+        "status": "met",
+        "reason": "The rear bumper is visible."
+      },
+      {
+        "requirement_id": "REQ_CAR_BODY_PANEL",
+        "status": "met",
+        "reason": "The panel surface can be inspected."
+      },
+      {
+        "requirement_id": "REQ_REVIEW_TRUST",
+        "status": "met",
+        "reason": "The image is usable and relevant."
+      }
+    ],
+    "fact_summary": "A dent is visible on the rear bumper.",
+    "risk_flags": ["none"],
+    "reviewable": true,
+    "claim_target_clear": true,
+    "diagnostics": []
+  }
+}
+```
+
+## Parser architecture
+
+`RuleBasedClaimParser` always runs. `LLMClaimParser` supports the OpenAI
+Responses API and injected replay clients, and must return the same structured
+schema. In the default `always` mode, both parsers run for every claim when an
+LLM provider is configured. The selector:
+
+1. records why the LLM was called or skipped;
+2. validates both results when the LLM runs;
+3. accepts agreement directly;
+4. records field-level disagreement;
+5. selects a validated, sufficiently confident LLM result;
+6. falls back to the rule parser when the LLM result is invalid or unavailable.
+
+The LLM parser is instructed to resolve multilingual negation and final claim
+scope from the original transcript. Exact source quotes remain mandatory.
+Translation or an English summary may be retained as diagnostics, but it is
+not a source of truth and cannot replace original-text quote validation.
+
+The deterministic fallback intentionally favors precision over recall. It
+handles common high-value scope forms such as `not X`, `not claiming X`, and
+`X claim nahi`, but returns `unknown` when a generic description or unfamiliar
+negation cannot be interpreted safely.
+
+`LLMClaimParser` remains provider-neutral through an injected client callable;
+the repository includes an OpenAI Responses API client plus deterministic
+replay. Replay JSON is keyed by `user_id`:
+
+```powershell
+python -B code/main.py `
+  --claim-provider replay `
+  --claim-routing always `
+  --llm-responses-json parser_responses.json
 ```
 
 Example response:
@@ -138,12 +355,20 @@ Tests cover:
 - output schema and placeholder semantics;
 - complete PreparedClaim JSON;
 - duplicate and missing input errors.
+- image decoding, orientation, resizing, and encoding;
+- strict per-image observation validation;
+- complete requirement-ID reporting;
+- rejection of final-decision fields in Sprint 2;
+- wrong-object risk consistency;
+- every sample image being reviewed independently;
+- per-image failure fallback without batch termination;
+- observation and raw-trace artifact writing.
 
 ## Main modules
 
 - `main.py`: command-line entry point
 - `claim_agent.py`: models, parsers, selector, loaders, rule matcher, and writers
+- `visual_agent.py`: image processing, VLM clients, observation validation,
+  retry/fallback handling, and Sprint 2 writers
 - `tests/test_claim_agent.py`: Sprint 1 automated tests
-
-Sprint 2 will consume `PreparedClaim` records and add per-image VLM
-observations without changing the original claim intent.
+- `tests/test_visual_agent.py`: Sprint 2 automated tests

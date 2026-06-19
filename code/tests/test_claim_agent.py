@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 CODE_DIR = Path(__file__).resolve().parents[1]
@@ -17,7 +19,9 @@ from claim_agent import (  # noqa: E402
     OUTPUT_COLUMNS,
     DataValidationError,
     LLMClaimParser,
+    OpenAIResponsesClaimClient,
     RuleBasedClaimParser,
+    claim_parser_schema,
     load_bundle,
     parse_claim_text,
     static_llm_client,
@@ -52,13 +56,33 @@ class ClaimParserTests(unittest.TestCase):
         self.assertIn("contents", parsed.claimed_parts)
         self.assertIn("missing_part", parsed.claimed_issue_types)
 
-    def test_extracts_spanish_car_damage(self) -> None:
+    def test_keeps_generic_spanish_damage_unknown(self) -> None:
         parsed = parse_claim_text(
             "Cliente: El parachoques trasero esta danado.",
             "car",
         )
         self.assertEqual(parsed.claimed_parts, ("rear_bumper",))
-        self.assertEqual(parsed.claimed_issue_types, ("broken_part",))
+        self.assertEqual(parsed.claimed_issue_types, ("unknown",))
+
+    def test_does_not_map_generic_mark_to_stain(self) -> None:
+        parsed = parse_claim_text(
+            "Customer: There is a mark on the hood. "
+            "Customer: The hood has a scratch.",
+            "car",
+        )
+        self.assertEqual(parsed.claimed_parts, ("hood",))
+        self.assertEqual(parsed.claimed_issue_types, ("scratch",))
+
+    def test_handles_hinglish_suffix_negation_and_final_scope(self) -> None:
+        parsed = parse_claim_text(
+            "Customer: Seal wali side phati hui thi. | "
+            "Customer: Abhi item missing claim nahi kar raha, "
+            "sirf torn packaging review karwana hai.",
+            "package",
+        )
+        self.assertEqual(parsed.claimed_parts, ("seal",))
+        self.assertEqual(parsed.excluded_parts, ("item",))
+        self.assertEqual(parsed.claimed_issue_types, ("torn_packaging",))
 
     def test_uses_unknown_instead_of_guessing(self) -> None:
         parsed = parse_claim_text(
@@ -84,7 +108,7 @@ class CompositeParserTests(unittest.TestCase):
         response = {
             self.claim.user_id: {
                 "claimed_parts": ["headlight"],
-                "claimed_issue_types": ["broken_part"],
+                "claimed_issue_types": ["unknown"],
                 "claimed_severity": "unknown",
                 "included_parts": ["headlight"],
                 "excluded_parts": [],
@@ -96,10 +120,204 @@ class CompositeParserTests(unittest.TestCase):
         parser = CompositeClaimParser(
             rule_parser=RuleBasedClaimParser(),
             llm_parser=LLMClaimParser(static_llm_client(response)),
+            llm_routing="always",
         )
         decision = parser.parse(self.claim)
         self.assertEqual(decision.selected.parser_name, "llm")
         self.assertIn("parser_disagreement", decision.diagnostics)
+
+    def test_default_routing_runs_rule_and_llm_together(self) -> None:
+        response = {
+            self.claim.user_id: {
+                "claimed_parts": ["front_bumper", "headlight"],
+                "claimed_issue_types": ["unknown"],
+                "claimed_severity": "unknown",
+                "included_parts": ["front_bumper", "headlight"],
+                "excluded_parts": [],
+                "evidence_quotes": ["front bumper", "left headlight"],
+                "parser_confidence": 0.9,
+                "parser_diagnostics": [],
+            }
+        }
+        parser = CompositeClaimParser(
+            llm_parser=LLMClaimParser(static_llm_client(response)),
+        )
+        decision = parser.parse(self.claim)
+        self.assertIsNotNone(decision.llm_result)
+        self.assertIn("llm_routing:always", decision.diagnostics)
+        self.assertIn("parser_disagreement", decision.diagnostics)
+        self.assertIn("parsers_agree_on_claim_intent", decision.diagnostics)
+        self.assertIn("difference:evidence_quotes", decision.diagnostics)
+        self.assertIn("difference:parser_confidence", decision.diagnostics)
+        self.assertIn("difference:parser_diagnostics", decision.diagnostics)
+
+    def test_records_excluded_part_difference_even_when_core_intent_agrees(self) -> None:
+        claim = type(self.claim)(
+            user_id="scope-difference",
+            image_paths=self.claim.image_paths,
+            user_claim="Customer: Not the keyboard; the screen is cracked.",
+            claim_object="laptop",
+            source_file=self.claim.source_file,
+            images=self.claim.images,
+        )
+        response = {
+            claim.user_id: {
+                "claimed_parts": ["screen"],
+                "claimed_issue_types": ["crack"],
+                "claimed_severity": "unknown",
+                "included_parts": ["screen"],
+                "excluded_parts": [],
+                "evidence_quotes": ["screen", "cracked"],
+                "parser_confidence": 0.9,
+                "parser_diagnostics": [],
+            }
+        }
+        parser = CompositeClaimParser(
+            llm_parser=LLMClaimParser(static_llm_client(response)),
+        )
+        decision = parser.parse(claim)
+        self.assertIn("parsers_agree_on_claim_intent", decision.diagnostics)
+        self.assertIn("difference:excluded_parts", decision.diagnostics)
+
+    def test_rejects_llm_when_each_specific_field_is_not_independently_sourced(
+        self,
+    ) -> None:
+        claim = type(self.claim)(
+            user_id="missing-field-evidence",
+            image_paths=self.claim.image_paths,
+            user_claim="Customer: There is a deep dent on the door.",
+            claim_object="car",
+            source_file=self.claim.source_file,
+            images=self.claim.images,
+        )
+        response = {
+            claim.user_id: {
+                "claimed_parts": ["door"],
+                "claimed_issue_types": ["dent"],
+                "claimed_severity": "high",
+                "included_parts": ["door"],
+                "excluded_parts": [],
+                "evidence_quotes": ["door"],
+                "parser_confidence": 0.99,
+                "parser_diagnostics": [],
+            }
+        }
+        parser = CompositeClaimParser(
+            llm_parser=LLMClaimParser(
+                static_llm_client(response),
+                max_attempts=1,
+            ),
+        )
+        decision = parser.parse(claim)
+        self.assertEqual(decision.selected.parser_name, "rule")
+        self.assertIn("llm_failed_fallback_to_rule", decision.diagnostics)
+        self.assertIn(
+            "Missing explicit source evidence for claimed_issue_types value: dent",
+            " | ".join(decision.diagnostics),
+        )
+
+    def test_rejects_excluded_part_without_negated_source_quote(self) -> None:
+        claim = type(self.claim)(
+            user_id="missing-negation-evidence",
+            image_paths=self.claim.image_paths,
+            user_claim="Customer: Not the keyboard; the screen is cracked.",
+            claim_object="laptop",
+            source_file=self.claim.source_file,
+            images=self.claim.images,
+        )
+        response = {
+            claim.user_id: {
+                "claimed_parts": ["screen"],
+                "claimed_issue_types": ["crack"],
+                "claimed_severity": "unknown",
+                "included_parts": ["screen"],
+                "excluded_parts": ["keyboard"],
+                "evidence_quotes": ["keyboard", "screen", "cracked"],
+                "parser_confidence": 0.99,
+                "parser_diagnostics": [],
+            }
+        }
+        parser = CompositeClaimParser(
+            llm_parser=LLMClaimParser(
+                static_llm_client(response),
+                max_attempts=1,
+            ),
+        )
+        decision = parser.parse(claim)
+        self.assertEqual(decision.selected.parser_name, "rule")
+        self.assertIn(
+            "Missing negated source evidence for excluded_parts value: keyboard",
+            " | ".join(decision.diagnostics),
+        )
+
+    def test_rejects_specific_issue_inferred_only_from_generic_damage_word(
+        self,
+    ) -> None:
+        claim = type(self.claim)(
+            user_id="generic-damage",
+            image_paths=self.claim.image_paths,
+            user_claim="Customer: The hood looks damaged.",
+            claim_object="car",
+            source_file=self.claim.source_file,
+            images=self.claim.images,
+        )
+        response = {
+            claim.user_id: {
+                "claimed_parts": ["hood"],
+                "claimed_issue_types": ["dent"],
+                "claimed_severity": "unknown",
+                "included_parts": ["hood"],
+                "excluded_parts": [],
+                "evidence_quotes": ["hood", "damaged"],
+                "parser_confidence": 0.99,
+                "parser_diagnostics": [],
+            }
+        }
+        parser = CompositeClaimParser(
+            llm_parser=LLMClaimParser(
+                static_llm_client(response),
+                max_attempts=1,
+            ),
+        )
+        decision = parser.parse(claim)
+        self.assertEqual(decision.selected.parser_name, "rule")
+        self.assertEqual(
+            decision.selected.claimed_issue_types,
+            ("unknown",),
+        )
+        self.assertIn("generic damage wording is insufficient", " | ".join(
+            decision.diagnostics
+        ))
+
+    def test_accepts_complete_per_field_source_evidence(self) -> None:
+        claim = type(self.claim)(
+            user_id="complete-provenance",
+            image_paths=self.claim.image_paths,
+            user_claim=(
+                "Customer: Not the hood. There is a deep dent on the door."
+            ),
+            claim_object="car",
+            source_file=self.claim.source_file,
+            images=self.claim.images,
+        )
+        response = {
+            claim.user_id: {
+                "claimed_parts": ["door"],
+                "claimed_issue_types": ["dent"],
+                "claimed_severity": "high",
+                "included_parts": ["door"],
+                "excluded_parts": ["hood"],
+                "evidence_quotes": ["Not the hood", "door", "dent", "deep"],
+                "parser_confidence": 0.99,
+                "parser_diagnostics": ["source_evidence_complete"],
+            }
+        }
+        parser = CompositeClaimParser(
+            llm_parser=LLMClaimParser(static_llm_client(response)),
+        )
+        decision = parser.parse(claim)
+        self.assertIsNotNone(decision.llm_result)
+        self.assertEqual(decision.selected.parser_name, "llm")
 
     def test_falls_back_when_llm_quote_is_not_in_source(self) -> None:
         response = {
@@ -118,11 +336,138 @@ class CompositeParserTests(unittest.TestCase):
             llm_parser=LLMClaimParser(
                 static_llm_client(response),
                 max_attempts=1,
-            )
+            ),
+            llm_routing="always",
         )
         decision = parser.parse(self.claim)
         self.assertEqual(decision.selected.parser_name, "rule")
         self.assertIn("llm_failed_fallback_to_rule", decision.diagnostics)
+
+    def test_auto_routing_skips_llm_when_rule_result_is_sufficient(self) -> None:
+        clear_claim = type(self.claim)(
+            user_id="clear",
+            image_paths=self.claim.image_paths,
+            user_claim="Customer: There is a deep dent on the door.",
+            claim_object="car",
+            source_file=self.claim.source_file,
+            images=self.claim.images,
+        )
+        client = mock.Mock(
+            return_value={
+                "claimed_parts": ["door"],
+                "claimed_issue_types": ["dent"],
+                "claimed_severity": "unknown",
+                "included_parts": ["door"],
+                "excluded_parts": [],
+                "evidence_quotes": ["door", "dent"],
+                "parser_confidence": 0.9,
+                "parser_diagnostics": [],
+            }
+        )
+        parser = CompositeClaimParser(
+            llm_parser=LLMClaimParser(client),
+            llm_routing="auto",
+        )
+        decision = parser.parse(clear_claim)
+        client.assert_not_called()
+        self.assertEqual(decision.selected.parser_name, "rule")
+        self.assertIn("llm_skipped_rule_sufficient", decision.diagnostics)
+
+    def test_auto_routing_invokes_llm_for_unknown_rule_issue(self) -> None:
+        claim = type(self.claim)(
+            user_id="spanish",
+            image_paths=self.claim.image_paths,
+            user_claim="Cliente: El parachoques trasero esta danado.",
+            claim_object="car",
+            source_file=self.claim.source_file,
+            images=self.claim.images,
+        )
+        response = {
+            "spanish": {
+                "claimed_parts": ["rear_bumper"],
+                "claimed_issue_types": ["unknown"],
+                "claimed_severity": "unknown",
+                "included_parts": ["rear_bumper"],
+                "excluded_parts": [],
+                "evidence_quotes": ["parachoques trasero"],
+                "parser_confidence": 0.8,
+                "parser_diagnostics": ["generic_damage_term"],
+            }
+        }
+        parser = CompositeClaimParser(
+            llm_parser=LLMClaimParser(static_llm_client(response)),
+            llm_routing="auto",
+        )
+        decision = parser.parse(claim)
+        self.assertIsNotNone(decision.llm_result)
+        self.assertIn("llm_routing:rule_unknown_issue", decision.diagnostics)
+
+
+class OpenAIClaimClientTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.claim = load_bundle(REPO_ROOT / "dataset").claims[0]
+
+    def test_claim_schema_is_scoped_to_current_object(self) -> None:
+        schema = claim_parser_schema(self.claim)
+        part_values = schema["properties"]["claimed_parts"]["items"]["enum"]
+        self.assertIn("headlight", part_values)
+        self.assertNotIn("screen", part_values)
+        self.assertFalse(schema["additionalProperties"])
+
+    def test_responses_client_requests_strict_structured_output(self) -> None:
+        payload = {
+            "claimed_parts": ["front_bumper", "headlight"],
+            "claimed_issue_types": ["unknown"],
+            "claimed_severity": "unknown",
+            "included_parts": ["front_bumper", "headlight"],
+            "excluded_parts": [],
+            "evidence_quotes": ["front bumper", "headlight"],
+            "parser_confidence": 0.9,
+            "parser_diagnostics": [],
+        }
+        api_response = {
+            "output": [
+                {
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": json.dumps(payload),
+                        }
+                    ]
+                }
+            ]
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return json.dumps(api_response).encode("utf-8")
+
+        with mock.patch(
+            "claim_agent.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ) as urlopen:
+            client = OpenAIResponsesClaimClient(
+                api_key="test-key",
+                model="gpt-5.4-mini",
+            )
+            result = client(self.claim, "test prompt")
+
+        request = urlopen.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(body["model"], "gpt-5.4-mini")
+        self.assertTrue(body["text"]["format"]["strict"])
+        self.assertEqual(
+            body["text"]["format"]["schema"]["additionalProperties"],
+            False,
+        )
+        self.assertEqual(json.loads(result), payload)
 
 
 class DatasetPipelineTests(unittest.TestCase):
@@ -184,6 +529,54 @@ class DatasetPipelineTests(unittest.TestCase):
             )
             self.assertIn("rule_result", payload[0]["claim_intent"])
             self.assertIn("history_summary", payload[0]["history"])
+
+    def test_sample_claim_intent_regressions(self) -> None:
+        bundle = load_bundle(self.dataset_dir, "sample_claims.csv")
+        prepared = {item.claim.user_id: item for item in bundle.prepared_claims}
+
+        self.assertEqual(
+            prepared["user_002"].parsed_claim.claimed_issue_types,
+            ("scratch",),
+        )
+        self.assertEqual(
+            prepared["user_008"].parsed_claim.claimed_parts,
+            ("hood",),
+        )
+        self.assertEqual(
+            prepared["user_008"].parsed_claim.claimed_issue_types,
+            ("scratch",),
+        )
+
+        package_corner_rules = {
+            item.requirement_id for item in prepared["user_015"].requirements
+        }
+        self.assertNotIn("REQ_PACKAGE_CONTENTS", package_corner_rules)
+
+        torn_claim = prepared["user_030"]
+        self.assertEqual(torn_claim.parsed_claim.claimed_parts, ("seal",))
+        self.assertEqual(torn_claim.parsed_claim.excluded_parts, ("item",))
+        self.assertEqual(
+            torn_claim.parsed_claim.claimed_issue_types,
+            ("torn_packaging",),
+        )
+        self.assertNotIn(
+            "REQ_PACKAGE_CONTENTS",
+            {item.requirement_id for item in torn_claim.requirements},
+        )
+
+        wet_package_rules = {
+            item.requirement_id for item in prepared["user_031"].requirements
+        }
+        self.assertNotIn("REQ_PACKAGE_CONTENTS", wet_package_rules)
+
+        missing_contents = prepared["user_032"].parsed_claim
+        self.assertEqual(missing_contents.claimed_parts, ("contents",))
+        self.assertEqual(missing_contents.excluded_parts, ())
+        self.assertEqual(missing_contents.claimed_issue_types, ("missing_part",))
+
+        hinge_claim = prepared["user_010"].parsed_claim
+        self.assertEqual(hinge_claim.claimed_parts, ("hinge",))
+        self.assertEqual(hinge_claim.claimed_issue_types, ("broken_part",))
 
     def test_missing_claim_file_has_clear_error(self) -> None:
         with self.assertRaisesRegex(DataValidationError, "does not exist"):
