@@ -20,6 +20,13 @@ Sprint 1 prepares each raw claim for a later visual agent. It:
 - treats generic words such as `damaged`, `mark`, and `issue` as insufficient
   to infer a specific damage enum;
 - keeps a deterministic rule parser as the baseline and fallback;
+- loads the versioned high-precision baseline vocabulary from
+  `claim_lexicon.json`, which contains no user IDs, case IDs, paths, or
+  row-specific answers;
+- leaves unsupported code-switched and complex-language expressions as
+  `unknown` for the LLM instead of adding sample-specific phrases to regexes;
+- parses issue type and claimed severity independently; damage words such as
+  `shattered` do not automatically imply `high` severity;
 - supports an optional structured LLM parser through a provider-neutral
   adapter;
 - validates parser enums, object-specific parts, confidence, and evidence
@@ -29,6 +36,7 @@ Sprint 1 prepares each raw claim for a later visual agent. It:
   include the negation or exclusion wording;
 - rejects LLM-specific damage enums when their only textual basis is a generic
   term such as `damaged`, `mark`, or `issue`;
+- rejects arrays that mix `unknown` or `none` with concrete enum values;
 - records rule/LLM differences for all parser fields, including scope,
   provenance quotes, confidence, and diagnostics, without merging outputs;
 - matches only valid requirements from `evidence_requirements.csv`;
@@ -162,7 +170,11 @@ The online client uses Responses API Structured Outputs. Every result is still
 checked locally for allowed fields, enums, object-specific parts, exact
 per-field source quotes, negated evidence for excluded parts, include/exclude
 overlap, generic-term overreach, and confidence. Invalid responses are retried
-and then fall back to the deterministic parser.
+and then fall back to the deterministic parser. Array uniqueness is enforced
+locally because the Structured Outputs JSON Schema subset does not accept the
+`uniqueItems` keyword. Paired quotation marks wrapped around an evidence quote
+are removed before validation, but the text inside must still occur verbatim
+in the original `user_claim`; no fuzzy matching or paraphrase is accepted.
 
 For offline replay:
 

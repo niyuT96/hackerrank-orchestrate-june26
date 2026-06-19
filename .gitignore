@@ -1,5 +1,6 @@
 *_cache
 *.csv
 *.json
+!code/claim_lexicon.json
 *.pyc
 .env

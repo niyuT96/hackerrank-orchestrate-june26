@@ -22,6 +22,7 @@ from claim_agent import (  # noqa: E402
     OpenAIResponsesClaimClient,
     RuleBasedClaimParser,
     claim_parser_schema,
+    load_claim_lexicon,
     load_bundle,
     parse_claim_text,
     static_llm_client,
@@ -73,16 +74,21 @@ class ClaimParserTests(unittest.TestCase):
         self.assertEqual(parsed.claimed_parts, ("hood",))
         self.assertEqual(parsed.claimed_issue_types, ("scratch",))
 
-    def test_handles_hinglish_suffix_negation_and_final_scope(self) -> None:
+    def test_rule_parser_defers_unmapped_code_switched_damage_to_unknown(self) -> None:
         parsed = parse_claim_text(
-            "Customer: Seal wali side phati hui thi. | "
-            "Customer: Abhi item missing claim nahi kar raha, "
-            "sirf torn packaging review karwana hai.",
+            "Customer: Seal wali side phati hui thi.",
             "package",
         )
         self.assertEqual(parsed.claimed_parts, ("seal",))
-        self.assertEqual(parsed.excluded_parts, ("item",))
-        self.assertEqual(parsed.claimed_issue_types, ("torn_packaging",))
+        self.assertEqual(parsed.claimed_issue_types, ("unknown",))
+
+    def test_shattered_is_damage_type_not_claimed_severity(self) -> None:
+        parsed = parse_claim_text(
+            "Customer: The screen looks shattered.",
+            "laptop",
+        )
+        self.assertEqual(parsed.claimed_issue_types, ("glass_shatter",))
+        self.assertEqual(parsed.claimed_severity, "unknown")
 
     def test_uses_unknown_instead_of_guessing(self) -> None:
         parsed = parse_claim_text(
@@ -294,7 +300,7 @@ class CompositeParserTests(unittest.TestCase):
             user_id="complete-provenance",
             image_paths=self.claim.image_paths,
             user_claim=(
-                "Customer: Not the hood. There is a deep dent on the door."
+                "Customer: Not the hood. There is a severe dent on the door."
             ),
             claim_object="car",
             source_file=self.claim.source_file,
@@ -307,7 +313,7 @@ class CompositeParserTests(unittest.TestCase):
                 "claimed_severity": "high",
                 "included_parts": ["door"],
                 "excluded_parts": ["hood"],
-                "evidence_quotes": ["Not the hood", "door", "dent", "deep"],
+                "evidence_quotes": ["Not the hood", "door", "dent", "severe"],
                 "parser_confidence": 0.99,
                 "parser_diagnostics": ["source_evidence_complete"],
             }
@@ -317,6 +323,83 @@ class CompositeParserTests(unittest.TestCase):
         )
         decision = parser.parse(claim)
         self.assertIsNotNone(decision.llm_result)
+        self.assertEqual(decision.selected.parser_name, "llm")
+
+    def test_rejects_unknown_mixed_with_specific_issue(self) -> None:
+        claim = type(self.claim)(
+            user_id="mixed-issue-sentinel",
+            image_paths=self.claim.image_paths,
+            user_claim="Customer: The hinge is broken and the screen wobbles.",
+            claim_object="laptop",
+            source_file=self.claim.source_file,
+            images=self.claim.images,
+        )
+        response = {
+            claim.user_id: {
+                "claimed_parts": ["hinge", "screen"],
+                "claimed_issue_types": ["broken_part", "unknown"],
+                "claimed_severity": "unknown",
+                "included_parts": ["hinge", "screen"],
+                "excluded_parts": [],
+                "evidence_quotes": ["hinge", "broken", "screen"],
+                "parser_confidence": 0.99,
+                "parser_diagnostics": [],
+            }
+        }
+        parser = CompositeClaimParser(
+            llm_parser=LLMClaimParser(
+                static_llm_client(response),
+                max_attempts=1,
+            ),
+        )
+        decision = parser.parse(claim)
+        self.assertEqual(decision.selected.parser_name, "rule")
+        self.assertIn(
+            "claimed_issue_types cannot combine sentinel values",
+            " | ".join(decision.diagnostics),
+        )
+
+    def test_normalizes_only_paired_wrapper_quotes_before_exact_source_check(
+        self,
+    ) -> None:
+        claim = type(self.claim)(
+            user_id="wrapped-quotes",
+            image_paths=self.claim.image_paths,
+            user_claim=(
+                "Customer: The back of the car has a dent now. "
+                "Mostly the rear bumper area."
+            ),
+            claim_object="car",
+            source_file=self.claim.source_file,
+            images=self.claim.images,
+        )
+        response = {
+            claim.user_id: {
+                "claimed_parts": ["rear_bumper"],
+                "claimed_issue_types": ["dent"],
+                "claimed_severity": "unknown",
+                "included_parts": ["rear_bumper"],
+                "excluded_parts": [],
+                "evidence_quotes": [
+                    '"The back of the car has a dent now."',
+                    "“Mostly the rear bumper area.”",
+                ],
+                "parser_confidence": 0.99,
+                "parser_diagnostics": [],
+            }
+        }
+        parser = CompositeClaimParser(
+            llm_parser=LLMClaimParser(static_llm_client(response)),
+        )
+        decision = parser.parse(claim)
+        self.assertIsNotNone(decision.llm_result)
+        self.assertEqual(
+            decision.llm_result.evidence_quotes,
+            (
+                "The back of the car has a dent now.",
+                "Mostly the rear bumper area.",
+            ),
+        )
         self.assertEqual(decision.selected.parser_name, "llm")
 
     def test_falls_back_when_llm_quote_is_not_in_source(self) -> None:
@@ -414,6 +497,7 @@ class OpenAIClaimClientTests(unittest.TestCase):
         self.assertIn("headlight", part_values)
         self.assertNotIn("screen", part_values)
         self.assertFalse(schema["additionalProperties"])
+        self.assertNotIn("uniqueItems", json.dumps(schema))
 
     def test_responses_client_requests_strict_structured_output(self) -> None:
         payload = {
@@ -530,53 +614,32 @@ class DatasetPipelineTests(unittest.TestCase):
             self.assertIn("rule_result", payload[0]["claim_intent"])
             self.assertIn("history_summary", payload[0]["history"])
 
-    def test_sample_claim_intent_regressions(self) -> None:
-        bundle = load_bundle(self.dataset_dir, "sample_claims.csv")
-        prepared = {item.claim.user_id: item for item in bundle.prepared_claims}
+    def test_rule_lexicon_is_external_and_not_keyed_by_dataset_identity(self) -> None:
+        lexicon = load_claim_lexicon()
+        serialized = json.dumps(lexicon, ensure_ascii=False).casefold()
+        self.assertNotIn("user_", serialized)
+        self.assertNotIn("case_", serialized)
+        self.assertNotIn("sample_claims", serialized)
 
-        self.assertEqual(
-            prepared["user_002"].parsed_claim.claimed_issue_types,
-            ("scratch",),
-        )
-        self.assertEqual(
-            prepared["user_008"].parsed_claim.claimed_parts,
-            ("hood",),
-        )
-        self.assertEqual(
-            prepared["user_008"].parsed_claim.claimed_issue_types,
-            ("scratch",),
-        )
-
-        package_corner_rules = {
-            item.requirement_id for item in prepared["user_015"].requirements
-        }
-        self.assertNotIn("REQ_PACKAGE_CONTENTS", package_corner_rules)
-
-        torn_claim = prepared["user_030"]
-        self.assertEqual(torn_claim.parsed_claim.claimed_parts, ("seal",))
-        self.assertEqual(torn_claim.parsed_claim.excluded_parts, ("item",))
-        self.assertEqual(
-            torn_claim.parsed_claim.claimed_issue_types,
-            ("torn_packaging",),
-        )
-        self.assertNotIn(
-            "REQ_PACKAGE_CONTENTS",
-            {item.requirement_id for item in torn_claim.requirements},
-        )
-
-        wet_package_rules = {
-            item.requirement_id for item in prepared["user_031"].requirements
-        }
-        self.assertNotIn("REQ_PACKAGE_CONTENTS", wet_package_rules)
-
-        missing_contents = prepared["user_032"].parsed_claim
-        self.assertEqual(missing_contents.claimed_parts, ("contents",))
-        self.assertEqual(missing_contents.excluded_parts, ())
-        self.assertEqual(missing_contents.claimed_issue_types, ("missing_part",))
-
-        hinge_claim = prepared["user_010"].parsed_claim
-        self.assertEqual(hinge_claim.claimed_parts, ("hinge",))
-        self.assertEqual(hinge_claim.claimed_issue_types, ("broken_part",))
+    def test_rule_baseline_processes_both_datasets_without_illegal_combinations(
+        self,
+    ) -> None:
+        for filename, expected_count in (
+            ("sample_claims.csv", 20),
+            ("claims.csv", 44),
+        ):
+            bundle = load_bundle(self.dataset_dir, filename)
+            self.assertEqual(len(bundle.prepared_claims), expected_count)
+            for prepared in bundle.prepared_claims:
+                parsed = prepared.parsed_claim
+                self.assertFalse(
+                    "unknown" in parsed.claimed_parts
+                    and len(parsed.claimed_parts) > 1
+                )
+                self.assertFalse(
+                    {"unknown", "none"} & set(parsed.claimed_issue_types)
+                    and len(parsed.claimed_issue_types) > 1
+                )
 
     def test_missing_claim_file_has_clear_error(self) -> None:
         with self.assertRaisesRegex(DataValidationError, "does not exist"):

@@ -1,0 +1,77 @@
+{
+  "version": "1.0",
+  "parts": {
+    "car": {
+      "front_bumper": ["\\bfront bumper\\b", "\\bparachoques delantero\\b"],
+      "rear_bumper": [
+        "\\brear bumper\\b",
+        "\\bback bumper\\b",
+        "\\bparachoques trasero\\b"
+      ],
+      "door": ["\\bdoor\\b"],
+      "hood": ["\\bhood\\b"],
+      "windshield": ["\\bwindshield\\b", "\\bfront glass\\b"],
+      "side_mirror": ["\\bside mirror\\b", "\\bleft mirror\\b", "\\bright mirror\\b"],
+      "headlight": ["\\bheadlight\\b"],
+      "taillight": ["\\btaillight\\b"],
+      "fender": ["\\bfender\\b"],
+      "quarter_panel": ["\\bquarter panel\\b"],
+      "body": ["\\bbody panel\\b", "\\bcar body\\b"]
+    },
+    "laptop": {
+      "screen": ["\\bscreen\\b", "\\bdisplay\\b", "\\bpantalla\\b"],
+      "keyboard": ["\\bkeyboard\\b", "\\bkeycaps?\\b", "\\bteclas?\\b"],
+      "trackpad": ["\\btrackpad\\b", "\\btouchpad\\b"],
+      "hinge": ["\\bhinge\\b"],
+      "lid": ["\\blid\\b"],
+      "corner": ["\\bcorner\\b"],
+      "port": ["\\bport\\b"],
+      "base": ["\\bbase\\b"],
+      "body": ["\\blaptop body\\b", "\\bouter body\\b"]
+    },
+    "package": {
+      "box": ["\\bbox\\b", "\\bpackage\\b", "\\bparcel\\b", "\\bpackaging\\b"],
+      "package_corner": ["\\bpackage corner\\b", "\\bbox corner\\b"],
+      "package_side": ["\\bpackage side\\b", "\\bbox side\\b"],
+      "seal": ["\\bseal\\b"],
+      "label": ["\\blabel\\b"],
+      "contents": ["\\bcontents?\\b", "\\bproduct inside\\b"],
+      "item": ["\\bitem\\b"]
+    }
+  },
+  "issues": {
+    "dent": ["\\bdent(?:ed|s)?\\b"],
+    "scratch": ["\\bscratch(?:ed)?\\b", "\\bscrape\\b"],
+    "crack": ["\\bcrack(?:ed)?\\b"],
+    "glass_shatter": ["\\bshatter(?:ed)?\\b"],
+    "broken_part": ["\\bbrok(?:e|en)\\b", "\\bsnapp(?:ed)?\\b", "\\bdetached\\b"],
+    "missing_part": ["\\bmissing\\b"],
+    "torn_packaging": ["\\btorn(?:-open)?\\b", "\\bopened package\\b"],
+    "crushed_packaging": ["\\bcrush(?:ed|ing)?\\b"],
+    "water_damage": ["\\bwater damage\\b", "\\bliquid damage\\b"],
+    "stain": ["\\bstain(?:ed)?\\b"]
+  },
+  "severity": {
+    "none": [
+      "\\bno damage\\b",
+      "\\bnot damaged\\b",
+      "\\bundamaged\\b",
+      "\\bintact\\b",
+      "\\bno (?:visible )?issue\\b"
+    ],
+    "low": ["\\bminor\\b", "\\bslight\\b", "\\blow severity\\b"],
+    "medium": ["\\bmoderate\\b", "\\bmedium severity\\b"],
+    "high": ["\\bsevere\\b", "\\bhigh severity\\b"]
+  },
+  "negation": [
+    "\\bnot\\b",
+    "\\bno\\b",
+    "\\bexcept\\b",
+    "\\bexclude(?:d)?\\b",
+    "\\bnot claiming\\b",
+    "\\bdo not claim\\b",
+    "\\bdon't claim\\b",
+    "\\bnahi\\b",
+    "\\bnahin\\b"
+  ]
+}

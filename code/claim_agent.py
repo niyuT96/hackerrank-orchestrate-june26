@@ -100,6 +100,7 @@ OBJECT_PARTS = {
         "unknown",
     },
 }
+CLAIM_LEXICON_PATH = Path(__file__).with_name("claim_lexicon.json")
 
 
 class DataValidationError(ValueError):
@@ -321,94 +322,100 @@ class ClaimParser(ABC):
         raise NotImplementedError
 
 
+def load_claim_lexicon(path: Path = CLAIM_LEXICON_PATH) -> dict[str, Any]:
+    """Load and validate the portable high-precision rule lexicon."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise DataValidationError(f"Claim lexicon does not exist: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise DataValidationError(f"Claim lexicon is invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise DataValidationError("Claim lexicon must be a JSON object")
+    required_sections = {"version", "parts", "issues", "severity", "negation"}
+    if set(payload) != required_sections:
+        raise DataValidationError(
+            "Claim lexicon sections must be exactly: "
+            + ", ".join(sorted(required_sections))
+        )
+    if set(payload["parts"]) != CLAIM_OBJECTS:
+        raise DataValidationError(
+            "Claim lexicon parts must define car, laptop, and package"
+        )
+    for claim_object, part_map in payload["parts"].items():
+        if not isinstance(part_map, dict):
+            raise DataValidationError(
+                f"Claim lexicon parts.{claim_object} must be an object"
+            )
+        invalid_parts = set(part_map) - (OBJECT_PARTS[claim_object] - {"unknown"})
+        if invalid_parts:
+            raise DataValidationError(
+                f"Claim lexicon has invalid {claim_object} parts: "
+                f"{sorted(invalid_parts)}"
+            )
+        _validate_pattern_map(part_map, f"parts.{claim_object}")
+    invalid_issues = set(payload["issues"]) - (ISSUE_TYPES - {"none", "unknown"})
+    if invalid_issues:
+        raise DataValidationError(
+            f"Claim lexicon has invalid issues: {sorted(invalid_issues)}"
+        )
+    _validate_pattern_map(payload["issues"], "issues")
+    if set(payload["severity"]) != SEVERITIES - {"unknown"}:
+        raise DataValidationError(
+            "Claim lexicon severity must define none, low, medium, and high"
+        )
+    _validate_pattern_map(payload["severity"], "severity")
+    _validate_patterns(payload["negation"], "negation")
+    return payload
+
+
+def _validate_pattern_map(value: Any, section: str) -> None:
+    if not isinstance(value, dict):
+        raise DataValidationError(f"Claim lexicon {section} must be an object")
+    for name, patterns in value.items():
+        _validate_patterns(patterns, f"{section}.{name}")
+
+
+def _validate_patterns(value: Any, section: str) -> None:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(item, str) or not item for item in value)
+    ):
+        raise DataValidationError(
+            f"Claim lexicon {section} must be a non-empty string list"
+        )
+    for pattern in value:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise DataValidationError(
+                f"Claim lexicon {section} contains invalid regex: {exc}"
+            ) from exc
+
+
+def _pattern_pairs(
+    pattern_map: Mapping[str, Sequence[str]],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (pattern, enum_value)
+        for enum_value, patterns in pattern_map.items()
+        for pattern in patterns
+    )
+
+
+CLAIM_LEXICON = load_claim_lexicon()
 PART_PATTERNS: dict[str, tuple[tuple[str, str], ...]] = {
-    "car": (
-        (r"\bfront bumper\b|\bparachoques delantero\b", "front_bumper"),
-        (
-            r"\brear bumper\b|\bback bumper\b|\bparachoques trasero\b|"
-            r"\bparachoques de atras\b",
-            "rear_bumper",
-        ),
-        (r"\bwindshield\b|\bfront glass\b", "windshield"),
-        (r"\bside mirror\b|\bleft mirror\b|\bright mirror\b", "side_mirror"),
-        (r"\bheadlight\b|\bfront light\b", "headlight"),
-        (r"\btaillight\b|\bback light\b", "taillight"),
-        (r"\bquarter panel\b", "quarter_panel"),
-        (r"\bfender\b", "fender"),
-        (r"\bhood\b", "hood"),
-        (r"\bdoor\b", "door"),
-        (r"\bbody panel\b|\bcar body\b|\bbody\b", "body"),
-    ),
-    "laptop": (
-        (r"\btrackpad\b|\btouchpad\b", "trackpad"),
-        (r"\bkeyboard\b|\bkeys?\b|\bkeycaps?\b|\bteclas?\b", "keyboard"),
-        (r"\bhinge\b", "hinge"),
-        (r"\bscreen\b|\bdisplay\b|\bpantalla\b", "screen"),
-        (r"\blid\b", "lid"),
-        (r"\bcorner\b", "corner"),
-        (r"\bport\b", "port"),
-        (r"\bbase\b", "base"),
-        (r"\bbody\b|\bouter body\b", "body"),
-    ),
-    "package": (
-        (r"\bpackage corner\b|\bbox corner\b|\bcorner\b", "package_corner"),
-        (r"\bpackage side\b|\bbox side\b|\bsurface\b", "package_side"),
-        (r"\bseal\b|\btape\b", "seal"),
-        (r"\blabel\b", "label"),
-        (r"\bcontents?\b|\bproduct inside\b", "contents"),
-        (r"\bitem\b|\bproduct\b", "item"),
-        (r"\bbox\b|\bpackage\b|\bparcel\b|\bpackaging\b", "box"),
-    ),
+    claim_object: _pattern_pairs(pattern_map)
+    for claim_object, pattern_map in CLAIM_LEXICON["parts"].items()
 }
-
-ISSUE_PATTERNS: tuple[tuple[str, str], ...] = (
-    (r"\bshatter(?:ed)?\b", "glass_shatter"),
-    (r"\bcrush(?:ed|ing)?\b|\bdab gaya\b", "crushed_packaging"),
-    (r"\btorn(?:-open)?\b|\bphati\b|\bopen(?:ed)? package\b", "torn_packaging"),
-    (r"\bwater damage\b|\bwet\b|\bliquid damage\b", "water_damage"),
-    (r"\bstain(?:ed)?\b", "stain"),
-    (r"\bmissing\b|\bfaltan\b|\bcame off\b", "missing_part"),
-    (
-        r"\bbrok(?:e|en)\b|\btoot gaya\b|\bsnapp(?:ed)?\b|\bdetached\b",
-        "broken_part",
-    ),
-    (r"\bcrack(?:ed)?\b", "crack"),
-    (r"\bscratch(?:ed)?\b|\bscrape\b", "scratch"),
-    (r"\bdent(?:ed|s)?\b", "dent"),
-)
-
-NO_DAMAGE_PATTERNS: tuple[str, ...] = (
-    r"\bno damage\b",
-    r"\bnot damaged\b",
-    r"\bundamaged\b",
-    r"\bintact\b",
-    r"\bno (?:visible )?issue\b",
-)
-
+ISSUE_PATTERNS = _pattern_pairs(CLAIM_LEXICON["issues"])
 SEVERITY_PATTERNS: dict[str, tuple[str, ...]] = {
-    "none": NO_DAMAGE_PATTERNS,
-    "low": (r"\bminor\b", r"\bsmall\b", r"\bslight\b", r"\blight\b"),
-    "medium": (r"\bmedium\b", r"\bmoderate\b"),
-    "high": (
-        r"\bsevere\b",
-        r"\bshattered\b",
-        r"\bbadly\b",
-        r"\bpretty bad\b",
-        r"\bdeep\b",
-    ),
+    severity: tuple(patterns)
+    for severity, patterns in CLAIM_LEXICON["severity"].items()
 }
-
-NEGATION_PATTERNS: tuple[str, ...] = (
-    r"\bnot\b",
-    r"\bno\b",
-    r"\bexcept\b",
-    r"\bexclude(?:d)?\b",
-    r"\bnot claiming\b",
-    r"\bdo not claim\b",
-    r"\bdon't claim\b",
-    r"\bnahi\b",
-    r"\bnahin\b",
-)
+NO_DAMAGE_PATTERNS = SEVERITY_PATTERNS["none"]
+NEGATION_PATTERNS = tuple(CLAIM_LEXICON["negation"])
 
 
 class RuleBasedClaimParser(ClaimParser):
@@ -762,14 +769,11 @@ def claim_llm_escalation_reasons(
         reasons.append("multiple_claimed_parts")
 
     text = claim.user_claim.casefold()
-    if any(ord(character) > 127 for character in text) or re.search(
-        r"\b(nahi|sirf|wali|esta|está|danado|dañado|parachoques|pantalla)\b",
-        text,
-    ):
+    if any(ord(character) > 127 for character in text):
         reasons.append("multilingual_or_code_switched")
     if rule_result.excluded_parts or re.search(
         r"\b(not claiming|do not claim|don't claim|not the|except|only|"
-        r"instead|rather than|nahi|sirf)\b",
+        r"instead|rather than)\b",
         text,
     ):
         reasons.append("complex_negation_or_scope")
@@ -787,13 +791,11 @@ def claim_parser_schema(claim: ClaimRecord) -> dict[str, Any]:
                 "type": "array",
                 "items": {"type": "string", "enum": parts},
                 "minItems": 1,
-                "uniqueItems": True,
             },
             "claimed_issue_types": {
                 "type": "array",
                 "items": {"type": "string", "enum": sorted(ISSUE_TYPES)},
                 "minItems": 1,
-                "uniqueItems": True,
             },
             "claimed_severity": {
                 "type": "string",
@@ -803,17 +805,14 @@ def claim_parser_schema(claim: ClaimRecord) -> dict[str, Any]:
                 "type": "array",
                 "items": {"type": "string", "enum": parts},
                 "minItems": 1,
-                "uniqueItems": True,
             },
             "excluded_parts": {
                 "type": "array",
                 "items": {"type": "string", "enum": parts},
-                "uniqueItems": True,
             },
             "evidence_quotes": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1},
-                "uniqueItems": True,
             },
             "parser_confidence": {
                 "type": "number",
@@ -850,7 +849,9 @@ def build_llm_claim_prompt(claim: ClaimRecord) -> str:
         "and parser_diagnostics. Resolve negation and final-confirmation scope "
         "from the original wording. claimed_parts must equal included_parts, and "
         "excluded_parts must contain explicitly rejected parts. Use unknown when "
-        "the user did not specify a field. Every positive or excluded specific "
+        "the user did not specify a field. unknown and none are sentinel values: "
+        "each may only appear as the sole value in its array and must never be "
+        "combined with a specific enum. Every positive or excluded specific "
         "value must be independently supported by an exact quote copied from "
         "user_claim. A quote supporting an excluded part must include both the "
         "part wording and its negation or exclusion wording. A quote supporting "
@@ -893,8 +894,12 @@ def parsed_claim_from_mapping(
         excluded_parts=_string_tuple(
             payload.get("excluded_parts", []), "excluded_parts", allow_empty=True
         ),
-        evidence_quotes=_string_tuple(
-            payload.get("evidence_quotes", []), "evidence_quotes", allow_empty=True
+        evidence_quotes=_normalize_evidence_quotes(
+            _string_tuple(
+                payload.get("evidence_quotes", []),
+                "evidence_quotes",
+                allow_empty=True,
+            )
         ),
         parser_name=parser_name,
         parser_confidence=float(payload.get("parser_confidence", 0.0)),
@@ -925,6 +930,23 @@ def validate_parsed_claim(parsed: ParsedClaim, claim: ClaimRecord) -> ParsedClai
         raise DataValidationError(f"Invalid issue types: {sorted(invalid_issues)}")
     if parsed.claimed_severity not in SEVERITIES:
         raise DataValidationError(f"Invalid claimed severity: {parsed.claimed_severity}")
+    _validate_sentinel_values(parsed.claimed_parts, "claimed_parts", {"unknown"})
+    _validate_sentinel_values(parsed.included_parts, "included_parts", {"unknown"})
+    _validate_sentinel_values(
+        parsed.claimed_issue_types,
+        "claimed_issue_types",
+        {"none", "unknown"},
+    )
+    if "unknown" in parsed.excluded_parts:
+        raise DataValidationError("excluded_parts cannot contain unknown")
+    if parsed.claimed_issue_types == ("none",) and parsed.claimed_severity != "none":
+        raise DataValidationError(
+            "claimed_issue_types=none requires claimed_severity=none"
+        )
+    if parsed.claimed_severity == "none" and parsed.claimed_issue_types != ("none",):
+        raise DataValidationError(
+            "claimed_severity=none requires claimed_issue_types=none"
+        )
     if set(parsed.included_parts) & set(parsed.excluded_parts):
         raise DataValidationError("included_parts and excluded_parts overlap")
     if parsed.claimed_parts != parsed.included_parts:
@@ -1403,16 +1425,6 @@ def _negated_spans(
             r"[^,.;!?]+?(?=,|;|\.|!|\?|\bbut\b|\bcorrect\b|$)",
             flags=re.IGNORECASE,
         ),
-        re.compile(
-            r"[^,.;!?]{0,80}?\bclaim(?:ing)?\b[^,.;!?]{0,30}?"
-            r"\b(?:nahi|nahin)\b[^,.;!?]{0,30}",
-            flags=re.IGNORECASE,
-        ),
-        re.compile(
-            r"[^,.;!?]{0,80}?\b(?:nahi|nahin)\b[^,.;!?]{0,30}?"
-            r"\bclaim(?:ing)?\b[^,.;!?]{0,30}",
-            flags=re.IGNORECASE,
-        ),
     )
     candidates = [
         (match.start(), match.end(), match.group(0).strip())
@@ -1507,14 +1519,11 @@ def _normalize_parts(
 
 
 def _claimed_severity(text: str) -> tuple[str, str | None]:
-    high = re.search(
-        r"\b(severe|shattered|badly|pretty bad|deep)\b", text, re.IGNORECASE
-    )
-    if high:
-        return "high", high.group(0)
-    low = re.search(r"\b(minor|small|slight|light)\b", text, re.IGNORECASE)
-    if low:
-        return "low", low.group(0)
+    for severity in ("high", "medium", "low"):
+        for pattern in SEVERITY_PATTERNS[severity]:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return severity, match.group(0)
     return "unknown", None
 
 
@@ -1540,6 +1549,19 @@ def _string_tuple(
     if not allow_empty and not result:
         raise DataValidationError(f"{field_name} cannot be empty")
     return result
+
+
+def _validate_sentinel_values(
+    values: Sequence[str],
+    field_name: str,
+    sentinels: set[str],
+) -> None:
+    present = sentinels & set(values)
+    if present and len(values) != 1:
+        raise DataValidationError(
+            f"{field_name} cannot combine sentinel values "
+            f"{sorted(present)} with other values"
+        )
 
 
 def _field_differences(
@@ -1588,6 +1610,30 @@ def _quotes_matching_enum(
 
 def _matches_any_pattern(text: str, patterns: Sequence[str]) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _normalize_evidence_quotes(quotes: Sequence[str]) -> tuple[str, ...]:
+    """Remove only paired wrapper quotes; preserve source text verbatim inside."""
+    wrappers = {
+        '"': '"',
+        "'": "'",
+        "“": "”",
+        "‘": "’",
+        "「": "」",
+        "『": "』",
+    }
+    normalized: list[str] = []
+    for raw_quote in quotes:
+        quote = raw_quote.strip()
+        if len(quote) >= 2 and wrappers.get(quote[0]) == quote[-1]:
+            quote = quote[1:-1].strip()
+        if not quote:
+            raise DataValidationError(
+                "evidence_quotes cannot contain an empty wrapped quote"
+            )
+        if quote not in normalized:
+            normalized.append(quote)
+    return tuple(normalized)
 
 
 def _bool_text(value: bool) -> str:
