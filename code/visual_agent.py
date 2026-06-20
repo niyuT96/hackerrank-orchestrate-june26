@@ -7,9 +7,11 @@ import hashlib
 import io
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -206,6 +208,107 @@ class VisionClient(ABC):
         schema: Mapping[str, Any],
     ) -> VLMResponse:
         raise NotImplementedError
+
+
+class RateLimitedVisionClient(VisionClient):
+    """Thread-safe fixed-interval RPM limiter around any vision client."""
+
+    def __init__(self, client: VisionClient, *, requests_per_minute: int) -> None:
+        if requests_per_minute < 1:
+            raise ValueError("requests_per_minute must be at least 1")
+        self.client = client
+        self.minimum_interval = 60.0 / requests_per_minute
+        self._lock = threading.Lock()
+        self._last_request = 0.0
+
+    def analyze(
+        self,
+        prepared: PreparedClaim,
+        image: ImageReference,
+        encoded: EncodedImage,
+        prompt: str,
+        schema: Mapping[str, Any],
+    ) -> VLMResponse:
+        with self._lock:
+            now = time.monotonic()
+            wait = self.minimum_interval - (now - self._last_request)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request = time.monotonic()
+        return self.client.analyze(prepared, image, encoded, prompt, schema)
+
+
+class CachingVisionClient(VisionClient):
+    """Content-addressed JSON cache keyed by image, prompt, schema, and model."""
+
+    def __init__(
+        self,
+        client: VisionClient,
+        cache_dir: Path,
+        *,
+        prompt_version: str = "vision-v1",
+        schema_version: str = "image-observation-v1",
+    ) -> None:
+        self.client = client
+        self.cache_dir = cache_dir
+        self.prompt_version = prompt_version
+        self.schema_version = schema_version
+        self._lock = threading.Lock()
+
+    def analyze(
+        self,
+        prepared: PreparedClaim,
+        image: ImageReference,
+        encoded: EncodedImage,
+        prompt: str,
+        schema: Mapping[str, Any],
+    ) -> VLMResponse:
+        model = getattr(self.client, "model", self.client.__class__.__name__)
+        key_payload = {
+            "image_sha256": encoded.sha256,
+            "model": str(model),
+            "prompt_version": self.prompt_version,
+            "schema_version": self.schema_version,
+            "prompt": prompt,
+            "schema": schema,
+        }
+        key = hashlib.sha256(
+            json.dumps(
+                key_payload, sort_keys=True, ensure_ascii=False
+            ).encode("utf-8")
+        ).hexdigest()
+        path = self.cache_dir / f"{key}.json"
+        with self._lock:
+            if path.is_file():
+                cached = json.loads(path.read_text(encoding="utf-8"))
+                raw = cached.get("raw_response")
+                if isinstance(raw, dict):
+                    raw = dict(raw)
+                    raw.setdefault("_claim_agent_cache", {})["hit"] = True
+                return VLMResponse(
+                    payload=cached["payload"],
+                    raw_response=raw,
+                    model_name=str(cached["model_name"]),
+                )
+        response = self.client.analyze(
+            prepared, image, encoded, prompt, schema
+        )
+        cache_value = {
+            "payload": response.payload,
+            "raw_response": response.raw_response,
+            "model_name": response.model_name,
+        }
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        with self._lock:
+            temporary.write_text(
+                json.dumps(
+                    cache_value, ensure_ascii=False, default=str
+                ),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+        return response
 
 
 class ReplayVisionClient(VisionClient):
@@ -782,6 +885,7 @@ class VisionReviewer:
         review_max_attempts: int | None = None,
         retry_delay_seconds: float = 0.0,
         max_dimension: int = 1600,
+        workers: int = 1,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -791,6 +895,9 @@ class VisionReviewer:
         self.review_max_attempts = review_max_attempts or max_attempts
         self.retry_delay_seconds = retry_delay_seconds
         self.max_dimension = max_dimension
+        if workers < 1:
+            raise ValueError("workers must be at least 1")
+        self.workers = workers
 
     def review(
         self,
@@ -802,8 +909,20 @@ class VisionReviewer:
             observations: list[ImageObservation] = []
             encoded_images: list[EncodedImage | None] = []
             case_traces: list[dict[str, Any]] = []
-            for image in prepared.claim.images:
-                observation, trace, encoded = self._primary_review(prepared, image)
+            if self.workers == 1 or len(prepared.claim.images) == 1:
+                primary_results = [
+                    self._primary_review(prepared, image)
+                    for image in prepared.claim.images
+                ]
+            else:
+                with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                    primary_results = list(
+                        executor.map(
+                            lambda image: self._primary_review(prepared, image),
+                            prepared.claim.images,
+                        )
+                    )
+            for observation, trace, encoded in primary_results:
                 observations.append(observation)
                 encoded_images.append(encoded)
                 case_traces.append(trace)

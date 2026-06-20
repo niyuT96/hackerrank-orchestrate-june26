@@ -106,11 +106,13 @@ call. It:
 - unions per-image risk flags and adds `user_history_risk` or
   `manual_review_required` from the claim history, but never uses history
   alone to override a clear visual conclusion;
+- builds an order-independent case-level fact index mapping parts, damage
+  types, and satisfied requirements back to the contributing image IDs;
 - determines `valid_image`: `true` unless all images are non-reviewable or the
   entire set has authenticity issues;
-- selects the single most informative image observation for visual-fact
-  extraction based on reviewability, target-part visibility, and damage
-  alignment;
+- uses the complete case-level fact index for evidence and status decisions;
+  the most informative image is used only to choose the primary output fact
+  and concise explanation;
 - derives `issue_type`, `object_part`, and `severity` from the best
   observation's visible facts;
 - evaluates `evidence_standard_met` by checking each matched requirement
@@ -125,6 +127,12 @@ call. It:
   - `supported` when the claimed part and damage type are both visible;
 - user claim `unknown` parts or issues are never auto-expanded to a more
   specific supported conclusion;
+- multiple confirmed parts use conservative all-target coverage until the
+  claim-understanding layer supplies an explicit `all`/`any` scope operator;
+  every target must have traceable matching damage evidence before the case is
+  supported;
+- missing-item claims require positive visual evidence of absence; a generic
+  no-damage observation cannot by itself contradict a missing-item claim;
 - `claimed_severity="unknown"` does not affect the damage-existence decision;
   the final `severity` always comes from visual facts;
 - selects `supporting_image_ids` traceable to `ImageObservation` records:
@@ -137,6 +145,8 @@ call. It:
 
 The aggregation entry point is `aggregate_visual_case(case) -> ReviewResult`
 in `decision_agent.py`. The writer is `write_final_output(cases, path)`.
+Persisted Sprint 2 JSON can be restored with
+`load_visual_reviews(path, prepared_claims)`.
 
 ## Requirements
 
@@ -275,6 +285,20 @@ The `--final-output` flag defaults to `output.csv` in the repository root.
 The Sprint 1 placeholder `sprint1_output.csv` is still written for
 diagnostics and must not be submitted as the final prediction.
 
+To rerun Sprint 3 deterministically from an existing Sprint 2 artifact without
+making additional vision calls:
+
+```powershell
+python -B code/main.py `
+  --claims-file sample_claims.csv `
+  --aggregate-only `
+  --visual-input sprint2_observations.json `
+  --final-output sample_output.csv
+```
+
+The loader rebinds stored observations to freshly validated local claims and
+rejects missing, duplicate, or invented image references.
+
 ## Run Sprint 2
 
 Using the OpenAI Responses API:
@@ -292,6 +316,23 @@ python -B code/main.py `
 `OPENAI_REVIEW_MODEL` overrides `--review-model` and defaults to `gpt-5.5`.
 Normal images are sent only to `OPENAI_VISION_MODEL`. The review model is called
 only when a fixed local escalation reason is present.
+
+Online vision calls use a content-addressed cache by default. The key includes
+the image SHA-256, model, prompt version, full prompt, schema version, and
+schema. Configure throughput without changing result ordering:
+
+```powershell
+python -B code/main.py `
+  --vision-provider openai `
+  --vision-workers 2 `
+  --vision-rpm-limit 60 `
+  --vision-cache-dir vision_cache
+```
+
+`--disable-vision-cache` disables the cache for a controlled experiment.
+Primary images within one case may run concurrently; the RPM wrapper remains
+thread-safe, and output cases/images are restored to deterministic input
+order. Replay mode is not rate-limited or cached.
 
 For deterministic replay testing, difficult-case review responses can be kept
 separate from primary responses:
@@ -459,6 +500,59 @@ absolute paths.
 ```powershell
 python -B -m unittest discover -s code/tests -v
 ```
+
+## Sprint 4 evaluation
+
+The evaluation entry point treats `dataset/sample_claims.csv` as the only
+ground-truth source. It reports:
+
+- case-level end-to-end field metrics against the supplied sample labels;
+- primary-only versus review-routed strategies after each produces complete
+  final case rows;
+- unlabeled parser, requirement, and visual diagnostics for investigation.
+
+No AI-generated claim-intent or per-image labels are used. Parser and visual
+diagnostics must not be interpreted as layer-level accuracy.
+
+Run after generating `sample_output.csv`, `sprint2_observations.json`, and
+`sprint2_trace.jsonl`:
+
+```powershell
+python -B code/evaluation/main.py
+```
+
+To include a real rule-versus-LLM parser comparison:
+
+```powershell
+python -B code/evaluation/main.py --claim-provider openai
+```
+
+This writes:
+
+- `code/evaluation/evaluation_report.md`;
+- `code/evaluation/evaluation_results.json`.
+
+The JSON contains full case-level metrics, unlabeled diagnostics, operational
+statistics, source scans, and a frozen strategy manifest. The Markdown report
+is the concise submission artifact. With `--claim-provider openai`, the report
+records LLM validation, disagreement, selection, and fallback counts; it does
+not claim LLM parsing accuracy because no independent parser labels exist.
+
+To validate a final 44-row prediction and build the submission archive:
+
+```powershell
+python -B code/evaluation/main.py `
+  --validate-only `
+  --claims-file claims.csv `
+  --predictions output.csv `
+  --expected-output-rows 44 `
+  --package code.zip
+```
+
+Do not run this test-set command until the sample strategy is frozen. The
+evaluator checks the 14-column schema, input-column preservation, enums,
+booleans, supporting-image provenance, cross-field invariants, secret
+patterns, and sample-identity coupling.
 
 Tests cover:
 

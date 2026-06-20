@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -25,9 +26,12 @@ from visual_agent import (  # noqa: E402
     ImageObservation,
     RequirementObservation,
     VisualReviewCase,
+    write_visual_reviews,
 )
 from decision_agent import (  # noqa: E402
     aggregate_visual_case,
+    build_case_visual_facts,
+    load_visual_reviews,
     write_final_output,
     _history_risk_flags,
     _evaluate_evidence_standard,
@@ -428,7 +432,9 @@ class AggregationIntegrationTests(unittest.TestCase):
 
     def test_user_history_risk_added_but_does_not_change_clear_visual(self) -> None:
         """History risk adds a flag but must not flip a clear supported → contradicted."""
-        prepared = _prepared_by_user("user_005")  # has rejected claims history
+        clear_claim = _prepared_by_user("user_001")
+        risky_history = _prepared_by_user("user_005").history
+        prepared = replace(clear_claim, history=risky_history)
         image = prepared.claim.images[0]
         obs = _make_observation(
             prepared, image,
@@ -440,6 +446,31 @@ class AggregationIntegrationTests(unittest.TestCase):
         result = aggregate_visual_case(case)
         self.assertIn("user_history_risk", result.risk_flags)
         self.assertEqual(result.claim_status, "supported")
+
+    def test_unknown_claim_issue_is_not_expanded_to_supported(self) -> None:
+        prepared = _prepared_by_user("user_005")
+        image = prepared.claim.images[0]
+        obs = _make_observation(
+            prepared, image,
+            visible_parts=["rear_bumper"],
+            visible_issue_types=["dent"],
+            severity="medium",
+        )
+        result = aggregate_visual_case(_make_case(prepared, [obs]))
+        self.assertEqual(result.claim_status, "not_enough_information")
+
+    def test_missing_item_is_not_contradicted_by_generic_no_damage(self) -> None:
+        prepared = _prepared_by_user("user_032")
+        obs = _make_observation(
+            prepared,
+            prepared.claim.images[0],
+            visible_parts=["contents"],
+            visible_issue_types=["none"],
+            severity="none",
+            risk_flags=["damage_not_visible"],
+        )
+        result = aggregate_visual_case(_make_case(prepared, [obs]))
+        self.assertEqual(result.claim_status, "not_enough_information")
 
     def test_multi_image_blurry_plus_clear_is_supported(self) -> None:
         """case_007 pattern: img_1 blurry, img_2 clear → supported using img_2."""
@@ -526,6 +557,132 @@ class AggregationIntegrationTests(unittest.TestCase):
             valid_ids = set(prepared.claim.image_ids)
             for img_id in result.supporting_image_ids:
                 self.assertIn(img_id, valid_ids, msg=prepared.claim.user_id)
+
+
+class GeneralizationAndMultiTargetTests(unittest.TestCase):
+    def _multi_part_prepared(self):
+        prepared = _prepared_by_user("user_002")
+        selected = replace(
+            prepared.parsed_claim,
+            claimed_parts=("front_bumper", "headlight"),
+            included_parts=("front_bumper", "headlight"),
+            claimed_issue_types=("scratch",),
+        )
+        decision = replace(prepared.parser_decision, selected=selected)
+        return replace(prepared, parser_decision=decision)
+
+    def test_partial_multi_part_coverage_is_not_supported(self) -> None:
+        prepared = self._multi_part_prepared()
+        obs1 = _make_observation(
+            prepared,
+            prepared.claim.images[0],
+            visible_parts=["front_bumper"],
+            visible_issue_types=["scratch"],
+        )
+        obs2 = _make_observation(
+            prepared,
+            prepared.claim.images[1],
+            visible_parts=["body"],
+            visible_issue_types=["none"],
+            severity="none",
+            target_part_visibility="not_visible",
+            risk_flags=["wrong_object_part", "damage_not_visible"],
+        )
+        result = aggregate_visual_case(_make_case(prepared, [obs1, obs2]))
+        self.assertEqual(result.claim_status, "not_enough_information")
+
+    def test_multi_part_evidence_can_be_complementary_across_images(self) -> None:
+        prepared = self._multi_part_prepared()
+        obs1 = _make_observation(
+            prepared,
+            prepared.claim.images[0],
+            visible_parts=["front_bumper"],
+            visible_issue_types=["scratch"],
+        )
+        obs2 = _make_observation(
+            prepared,
+            prepared.claim.images[1],
+            visible_parts=["headlight"],
+            visible_issue_types=["scratch"],
+        )
+        result = aggregate_visual_case(_make_case(prepared, [obs1, obs2]))
+        self.assertEqual(result.claim_status, "supported")
+        self.assertEqual(set(result.supporting_image_ids), {"img_1", "img_2"})
+
+    def test_image_order_does_not_change_case_decision(self) -> None:
+        prepared = _prepared_by_user("user_003")
+        blurry = _make_observation(
+            prepared,
+            prepared.claim.images[0],
+            visible_parts=["unknown"],
+            visible_issue_types=["unknown"],
+            severity="unknown",
+            target_part_visibility="unknown",
+            req_status="not_met",
+            risk_flags=["blurry_image"],
+            claim_target_clear=False,
+        )
+        clear = _make_observation(
+            prepared,
+            prepared.claim.images[1],
+            visible_parts=["door"],
+            visible_issue_types=["dent"],
+        )
+        forward = aggregate_visual_case(_make_case(prepared, [blurry, clear]))
+        reverse = aggregate_visual_case(_make_case(prepared, [clear, blurry]))
+        self.assertEqual(
+            (
+                forward.evidence_standard_met,
+                forward.claim_status,
+                forward.valid_image,
+                forward.risk_flags,
+                forward.supporting_image_ids,
+            ),
+            (
+                reverse.evidence_standard_met,
+                reverse.claim_status,
+                reverse.valid_image,
+                reverse.risk_flags,
+                reverse.supporting_image_ids,
+            ),
+        )
+
+    def test_case_visual_facts_are_traceable(self) -> None:
+        prepared = self._multi_part_prepared()
+        observations = tuple(
+            _make_observation(
+                prepared,
+                image,
+                visible_parts=[part],
+                visible_issue_types=["scratch"],
+            )
+            for image, part in zip(
+                prepared.claim.images, ("front_bumper", "headlight")
+            )
+        )
+        facts = build_case_visual_facts(observations, prepared)
+        self.assertEqual(facts.part_image_ids["front_bumper"], ("img_1",))
+        self.assertEqual(facts.part_image_ids["headlight"], ("img_2",))
+        self.assertEqual(
+            set(facts.requirement_image_ids),
+            {item.requirement_id for item in prepared.requirements},
+        )
+
+    def test_persisted_visual_reviews_can_be_aggregated_offline(self) -> None:
+        prepared = _prepared_by_user("user_001")
+        case = _make_case(
+            prepared,
+            [_make_observation(prepared, prepared.claim.images[0])],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            visual_path = Path(tmpdir) / "visual.json"
+            output_path = Path(tmpdir) / "output.csv"
+            write_visual_reviews([case], visual_path)
+            loaded = load_visual_reviews(visual_path, [prepared])
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(write_final_output(loaded, output_path), 1)
+            row = next(csv.DictReader(output_path.open(encoding="utf-8")))
+            self.assertEqual(row["claim_status"], "supported")
 
 
 # ---------------------------------------------------------------------------

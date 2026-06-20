@@ -21,14 +21,16 @@ from claim_agent import (
     write_prepared_claims,
 )
 from visual_agent import (
+    CachingVisionClient,
     OpenAIResponsesVisionClient,
+    RateLimitedVisionClient,
     ReplayVisionClient,
     VisionReviewer,
     load_replay_responses,
     write_visual_reviews,
     write_visual_traces,
 )
-from decision_agent import write_final_output
+from decision_agent import load_visual_reviews, write_final_output
 
 
 CODE_DIR = Path(__file__).resolve().parent
@@ -186,12 +188,51 @@ def build_parser() -> argparse.ArgumentParser:
         default=1600,
     )
     parser.add_argument(
+        "--vision-workers",
+        type=int,
+        default=1,
+        help="Maximum concurrent primary image reviews per claim.",
+    )
+    parser.add_argument(
+        "--vision-rpm-limit",
+        type=int,
+        default=60,
+        help="Maximum requests per minute across concurrent vision calls.",
+    )
+    parser.add_argument(
+        "--vision-cache-dir",
+        type=Path,
+        default=REPO_ROOT / "vision_cache",
+        help="Content-addressed response cache directory.",
+    )
+    parser.add_argument(
+        "--disable-vision-cache",
+        action="store_true",
+    )
+    parser.add_argument(
         "--final-output",
         type=Path,
         default=DEFAULT_FINAL_OUTPUT,
         help=(
             "Sprint 3 final output.csv path. Written only when --vision-provider "
             "is not 'none'."
+        ),
+    )
+    parser.add_argument(
+        "--visual-input",
+        type=Path,
+        help=(
+            "Existing Sprint 2 observations JSON to aggregate without making "
+            "new vision calls."
+        ),
+    )
+    parser.add_argument(
+        "--aggregate-only",
+        action="store_true",
+        help=(
+            "Run Sprint 3 from --visual-input. This mode rejects a configured "
+            "vision provider so persisted observations are not mixed with a "
+            "new model run."
         ),
     )
     return parser
@@ -268,6 +309,29 @@ def _vision_reviewer(args: argparse.Namespace) -> VisionReviewer | None:
             model=review_model,
             timeout_seconds=args.vision_timeout,
         )
+    if args.vision_rpm_limit < 1:
+        raise DataValidationError("--vision-rpm-limit must be at least 1")
+    if args.vision_workers < 1:
+        raise DataValidationError("--vision-workers must be at least 1")
+    if args.vision_provider == "openai":
+        client = RateLimitedVisionClient(
+            client, requests_per_minute=args.vision_rpm_limit
+        )
+        if review_client is not None:
+            review_client = RateLimitedVisionClient(
+                review_client, requests_per_minute=args.vision_rpm_limit
+            )
+    if (
+        args.vision_provider == "openai"
+        and not args.disable_vision_cache
+    ):
+        client = CachingVisionClient(client, args.vision_cache_dir)
+        if review_client is not None:
+            review_client = CachingVisionClient(
+                review_client,
+                args.vision_cache_dir / "review",
+                prompt_version="vision-review-v1",
+            )
     return VisionReviewer(
         client,
         review_client=review_client,
@@ -275,10 +339,19 @@ def _vision_reviewer(args: argparse.Namespace) -> VisionReviewer | None:
         review_max_attempts=args.review_max_attempts,
         retry_delay_seconds=args.vision_retry_delay,
         max_dimension=args.vision_max_dimension,
+        workers=args.vision_workers,
     )
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.aggregate_only and not args.visual_input:
+        raise DataValidationError(
+            "--aggregate-only requires --visual-input"
+        )
+    if args.aggregate_only and args.vision_provider != "none":
+        raise DataValidationError(
+            "--aggregate-only cannot be combined with --vision-provider"
+        )
     bundle = load_bundle(
         args.dataset_dir,
         args.claims_file,
@@ -296,6 +369,17 @@ def run(args: argparse.Namespace) -> int:
     )
     if row_count != prepared_count:
         return 3
+
+    if args.aggregate_only:
+        cases = load_visual_reviews(
+            args.visual_input.resolve(), bundle.prepared_claims
+        )
+        final_count = write_final_output(cases, args.final_output.resolve())
+        print(
+            f"Sprint 3 offline aggregation complete; wrote {final_count} "
+            f"decisions to {args.final_output.resolve()}"
+        )
+        return 0 if final_count == prepared_count else 5
 
     reviewer = _vision_reviewer(args)
     if reviewer is not None:

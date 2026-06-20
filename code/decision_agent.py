@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import csv
-import re
-from dataclasses import replace
+import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 from claim_agent import (
     CLAIM_STATUSES,
@@ -14,7 +14,6 @@ from claim_agent import (
     OBJECT_PARTS,
     RISK_FLAGS,
     SEVERITIES,
-    ClaimRecord,
     DataValidationError,
     OUTPUT_COLUMNS,
     PreparedClaim,
@@ -22,7 +21,126 @@ from claim_agent import (
     UserHistory,
     _bool_text,
 )
-from visual_agent import ImageObservation, VisualReviewCase
+from visual_agent import (
+    EscalationAudit,
+    ImageObservation,
+    RequirementObservation,
+    VisualReviewCase,
+    validate_image_observation,
+)
+
+
+@dataclass(frozen=True)
+class CaseVisualFacts:
+    """Order-independent, traceable visual facts for one claim.
+
+    Sprint 3 decisions use this case-level view.  A single best image is kept
+    only for choosing the primary output fact and concise explanation.
+    """
+
+    reviewable_observations: tuple[ImageObservation, ...]
+    visible_objects: frozenset[str]
+    visible_parts: frozenset[str]
+    visible_issue_types: frozenset[str]
+    part_image_ids: Mapping[str, tuple[str, ...]]
+    issue_image_ids: Mapping[str, tuple[str, ...]]
+    requirement_image_ids: Mapping[str, tuple[str, ...]]
+    identity_conflict: bool
+    conflicting_image_ids: tuple[str, ...]
+
+
+def _stable_observations(
+    observations: Iterable[ImageObservation],
+) -> tuple[ImageObservation, ...]:
+    return tuple(sorted(observations, key=lambda item: (item.path, item.image_id)))
+
+
+def build_case_visual_facts(
+    observations: tuple[ImageObservation, ...],
+    prepared: PreparedClaim,
+) -> CaseVisualFacts:
+    """Aggregate all per-image observations without depending on input order."""
+    ordered = _stable_observations(observations)
+    reviewable = tuple(item for item in ordered if item.reviewable)
+    visible_objects = frozenset(
+        item.actual_object
+        for item in reviewable
+        if item.actual_object != "unknown"
+    )
+    visible_parts = frozenset(
+        part
+        for item in reviewable
+        for part in item.visible_parts
+        if part != "unknown"
+    )
+    visible_issues = frozenset(
+        issue
+        for item in reviewable
+        for issue in item.visible_issue_types
+        if issue not in {"unknown", "none"}
+    )
+
+    def image_map(values: str) -> dict[str, tuple[str, ...]]:
+        result: dict[str, list[str]] = {}
+        for item in reviewable:
+            entries = (
+                item.visible_parts
+                if values == "parts"
+                else item.visible_issue_types
+            )
+            for entry in entries:
+                if entry in {"unknown", "none"}:
+                    continue
+                result.setdefault(entry, []).append(item.image_id)
+        return {
+            key: tuple(dict.fromkeys(ids))
+            for key, ids in sorted(result.items())
+        }
+
+    requirement_images: dict[str, list[str]] = {}
+    for item in reviewable:
+        for result in item.requirement_results:
+            if result.status == "met":
+                requirement_images.setdefault(
+                    result.requirement_id, []
+                ).append(item.image_id)
+
+    concrete_objects = {
+        item.actual_object
+        for item in ordered
+        if item.actual_object != "unknown"
+    }
+    wrong_object_ids = {
+        item.image_id
+        for item in ordered
+        if (
+            "wrong_object" in item.risk_flags
+            or item.actual_object
+            not in {"unknown", prepared.claim.claim_object}
+        )
+    }
+    identity_conflict = len(ordered) > 1 and (
+        len(concrete_objects) > 1 or bool(wrong_object_ids)
+    )
+    conflicting_ids = (
+        tuple(item.image_id for item in ordered)
+        if identity_conflict
+        else ()
+    )
+    return CaseVisualFacts(
+        reviewable_observations=reviewable,
+        visible_objects=visible_objects,
+        visible_parts=visible_parts,
+        visible_issue_types=visible_issues,
+        part_image_ids=image_map("parts"),
+        issue_image_ids=image_map("issues"),
+        requirement_image_ids={
+            key: tuple(dict.fromkeys(ids))
+            for key, ids in sorted(requirement_images.items())
+        },
+        identity_conflict=identity_conflict,
+        conflicting_image_ids=conflicting_ids,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +195,7 @@ def _history_risk_flags(history: UserHistory) -> frozenset[str]:
 def _evaluate_evidence_standard(
     observations: tuple[ImageObservation, ...],
     prepared: PreparedClaim,
+    facts: CaseVisualFacts | None = None,
 ) -> tuple[bool, str]:
     """Return (met, reason) for the case-level evidence standard.
 
@@ -91,34 +210,19 @@ def _evaluate_evidence_standard(
     if not observations:
         return False, "No images were submitted for this claim."
 
-    # Check for multi-image identity conflict that undermines the whole set
-    if len(observations) > 1:
-        concrete_objects = {
-            obs.actual_object
-            for obs in observations
-            if obs.actual_object != "unknown"
-        }
-        has_identity_conflict = (
-            len(concrete_objects) > 1
-            or any(
-                "wrong_object" in obs.risk_flags
-                for obs in observations
-            )
+    facts = facts or build_case_visual_facts(observations, prepared)
+    if facts.identity_conflict:
+        return (
+            False,
+            "The submitted images appear to show different objects or vehicles, "
+            "so the image set cannot reliably support the claim."
         )
-        if has_identity_conflict:
-            return (
-                False,
-                "The submitted images appear to show different objects or vehicles, "
-                "so the image set cannot reliably support the claim."
-            )
 
     # Build per-requirement best status across all images
     req_status: dict[str, str] = {
         req.requirement_id: "not_met" for req in prepared.requirements
     }
-    for obs in observations:
-        if not obs.reviewable:
-            continue
+    for obs in facts.reviewable_observations:
         for rr in obs.requirement_results:
             if rr.requirement_id not in req_status:
                 continue
@@ -196,16 +300,23 @@ def _pick_best_observation(
 
     if not observations:
         return None
-    return max(observations, key=score)
+    ordered = _stable_observations(observations)
+    return max(ordered, key=lambda item: (score(item), item.path, item.image_id))
 
 
-def _derive_issue_type(obs: ImageObservation) -> str:
+def _derive_issue_type(
+    obs: ImageObservation,
+    claimed_issues: frozenset[str] = frozenset(),
+) -> str:
     """Extract the single most relevant issue type from an observation."""
     if obs.visible_issue_types == ("unknown",):
         return "unknown"
     if obs.visible_issue_types == ("none",):
         return "none"
     concrete = [t for t in obs.visible_issue_types if t not in {"unknown", "none"}]
+    for issue in concrete:
+        if issue in claimed_issues:
+            return issue
     return concrete[0] if concrete else "unknown"
 
 
@@ -231,13 +342,7 @@ def _derive_object_part(
             if part in overlap:
                 return part
 
-    # Fall back to the first claimed part if we at least know what was claimed
-    if claimed_parts:
-        first_claimed = next(iter(prepared.parsed_claim.claimed_parts))
-        if first_claimed != "unknown" and first_claimed in allowed_parts:
-            return first_claimed
-
-    # Fall back to any visible allowed part
+    # Fall back to any actually visible allowed part.
     for part in obs.visible_parts:
         if part in allowed_parts and part != "unknown":
             return part
@@ -292,6 +397,7 @@ def _decide_claim_status(
     prepared: PreparedClaim,
     evidence_standard_met: bool,
     best: ImageObservation | None,
+    facts: CaseVisualFacts | None = None,
 ) -> str:
     """Determine supported / contradicted / not_enough_information.
 
@@ -303,60 +409,87 @@ def _decide_claim_status(
     if not evidence_standard_met or best is None:
         return "not_enough_information"
 
+    facts = facts or build_case_visual_facts(observations, prepared)
     claimed_parts = frozenset(prepared.parsed_claim.claimed_parts) - {"unknown"}
     claimed_issues = frozenset(
         prepared.parsed_claim.claimed_issue_types
     ) - {"unknown", "none"}
 
-    visible_parts = frozenset(best.visible_parts) - {"unknown"}
-    visible_issues = frozenset(best.visible_issue_types) - {"unknown", "none"}
-    issue_is_none = best.visible_issue_types == ("none",)
-
     # --- contradicted path 1: wrong object ---
-    if "wrong_object" in best.risk_flags:
-        return "contradicted"
-
-    # --- contradicted path 2: claimed part visible but explicitly no damage ---
-    if (
-        best.target_part_visibility == "visible"
-        and issue_is_none
-        and claimed_issues
+    if any(
+        "wrong_object" in item.risk_flags
+        or item.actual_object
+        not in {"unknown", prepared.claim.claim_object}
+        for item in observations
     ):
         return "contradicted"
 
-    # --- contradicted path 3: visible issue type explicitly mismatches claimed ---
-    if (
-        claimed_issues
-        and visible_issues
-        and not claimed_issues & visible_issues
-    ):
-        return "contradicted"
-
-    # --- not_enough_information: target part not visible or observation unclear ---
-    if best.target_part_visibility in {"not_visible", "unknown"}:
-        if claimed_parts and not claimed_parts & visible_parts:
-            return "not_enough_information"
-
-    # --- not_enough_information: both sides unknown ---
-    if not claimed_parts and not visible_parts:
+    # Unknown claim scope must not be expanded from visual facts.
+    if not claimed_parts or not claimed_issues:
         return "not_enough_information"
 
-    # --- supported: claimed part visible and damage matches (or no damage claimed) ---
-    if claimed_parts:
-        parts_ok = bool(claimed_parts & visible_parts)
-    else:
-        parts_ok = bool(visible_parts)  # anything visible is fine if no part specified
+    # Multiple confirmed parts use conservative ALL semantics until Sprint 1
+    # supplies an explicit scope operator.  Partial coverage is insufficient.
+    if not claimed_parts.issubset(facts.visible_parts):
+        return "not_enough_information"
 
-    if claimed_issues:
-        issues_ok = bool(claimed_issues & visible_issues)
-    else:
-        # no specific damage claimed — any visible state (including none) is fine
-        issues_ok = True
+    observations_by_part = {
+        part: tuple(
+            item
+            for item in facts.reviewable_observations
+            if part in item.visible_parts
+        )
+        for part in claimed_parts
+    }
+    part_has_matching_damage = {
+        part: any(
+            claimed_issues
+            & (set(item.visible_issue_types) - {"unknown", "none"})
+            for item in part_observations
+        )
+        for part, part_observations in observations_by_part.items()
+    }
 
-    if parts_ok and issues_ok:
+    # Every confirmed target must have traceable matching damage evidence.
+    if all(part_has_matching_damage.values()) and claimed_issues.issubset(
+        facts.visible_issue_types
+    ):
         return "supported"
 
-    # Conservative default when there is partial information
+    # An image showing an opened contents area without an explicit
+    # ``missing_part`` observation cannot prove that the expected item was
+    # present.  Absence claims require positive evidence of absence or remain
+    # insufficient; generic "no damage" is not a contradiction.
+    if "missing_part" in claimed_issues and "missing_part" not in (
+        facts.visible_issue_types
+    ):
+        return "not_enough_information"
+
+    # A fully visible target with an explicit no-damage observation contradicts
+    # the claim only when no matching damage exists for that target.
+    no_damage_parts = {
+        part
+        for part, part_observations in observations_by_part.items()
+        if part_observations
+        and any(
+            item.target_part_visibility == "visible"
+            and item.visible_issue_types == ("none",)
+            for item in part_observations
+        )
+        and not part_has_matching_damage[part]
+    }
+    if no_damage_parts == claimed_parts:
+        return "contradicted"
+
+    # Concrete visual damage that has no overlap with the user's asserted
+    # damage is a contradiction once all target parts are visible.
+    if facts.visible_issue_types and not (
+        claimed_issues & facts.visible_issue_types
+    ):
+        return "contradicted"
+
+    # Partial target/damage coverage remains insufficient rather than silently
+    # broadening the user's claim.
     return "not_enough_information"
 
 
@@ -379,10 +512,11 @@ def _select_supporting_images(
     - contradicted: list the image showing the contradiction
     - supported: list only the image(s) showing the claimed damage
     """
+    ordered = _stable_observations(observations)
     if claim_status == "not_enough_information":
         # Include images that contributed to the determination even if insufficient
         useful = [
-            obs for obs in observations
+            obs for obs in ordered
             if obs.reviewable and obs.visible_parts != ("unknown",)
         ]
         if not useful:
@@ -390,16 +524,16 @@ def _select_supporting_images(
         # If there's a multi-image identity conflict, include all conflicting images
         has_identity_conflict = any(
             "wrong_object" in obs.risk_flags or "claim_mismatch" in obs.risk_flags
-            for obs in observations
+            for obs in ordered
         )
         if has_identity_conflict:
-            return tuple(obs.image_id for obs in observations)
+            return tuple(obs.image_id for obs in ordered)
         return ()
 
     if claim_status == "contradicted":
         # The image(s) showing the contradiction
         contradiction_ids: list[str] = []
-        for obs in observations:
+        for obs in ordered:
             visible_parts = frozenset(obs.visible_parts) - {"unknown"}
             visible_issues = frozenset(obs.visible_issue_types) - {"unknown"}
             target_ok = (
@@ -414,26 +548,34 @@ def _select_supporting_images(
     # supported — the image(s) that clearly show the claimed damage
     assert claim_status == "supported"
     supporting: list[str] = []
-    for obs in observations:
+    covered_parts: set[str] = set()
+    covered_issues: set[str] = set()
+    for obs in ordered:
         if not obs.reviewable:
             continue
         visible_parts = frozenset(obs.visible_parts) - {"unknown"}
         visible_issues = frozenset(obs.visible_issue_types) - {"unknown", "none"}
-        parts_ok = (
-            bool(claimed_parts & visible_parts) if claimed_parts else bool(visible_parts)
-        )
-        issues_ok = (
-            bool(claimed_issues & visible_issues) if claimed_issues else True
-        )
+        matched_parts = claimed_parts & visible_parts
+        matched_issues = claimed_issues & visible_issues
+        parts_ok = bool(matched_parts)
+        issues_ok = bool(matched_issues)
         target_visible = obs.target_part_visibility == "visible"
         if parts_ok and issues_ok and target_visible:
             supporting.append(obs.image_id)
+            covered_parts.update(matched_parts)
+            covered_issues.update(matched_issues)
     # If strict match found nothing but we know claim is supported, fall back to
     # any reviewable image that at least shows the right object
     if not supporting:
-        for obs in observations:
+        for obs in ordered:
             if obs.reviewable and obs.target_part_visibility == "visible":
                 supporting.append(obs.image_id)
+    elif not claimed_parts.issubset(covered_parts) or not claimed_issues.issubset(
+        covered_issues
+    ):
+        # A caller must not serialize a partially supported multi-target claim
+        # as if the selected images covered the complete confirmed scope.
+        return ()
     return tuple(supporting)
 
 
@@ -553,9 +695,18 @@ def aggregate_visual_case(case: VisualReviewCase) -> ReviewResult:
         prepared.parsed_claim.claimed_issue_types
     ) - {"unknown", "none"}
 
+    facts = build_case_visual_facts(observations, prepared)
+
     # 1. Risk flags
     history_flags = _history_risk_flags(prepared.history)
     risk_flags = _aggregate_risk_flags(observations, history_flags)
+    if facts.identity_conflict and "manual_review_required" not in risk_flags:
+        risk_flags = tuple(
+            sorted(
+                (set(risk_flags) - {"none"})
+                | {"claim_mismatch", "manual_review_required"}
+            )
+        )
 
     # 2. Valid image set
     valid_image = _is_valid_image_set(observations)
@@ -565,7 +716,7 @@ def aggregate_visual_case(case: VisualReviewCase) -> ReviewResult:
 
     # 4. Visual fact fields
     if best is not None and best.reviewable:
-        issue_type = _derive_issue_type(best)
+        issue_type = _derive_issue_type(best, claimed_issues)
         object_part = _derive_object_part(best, prepared)
         severity = _derive_severity(best)
     else:
@@ -580,7 +731,7 @@ def aggregate_visual_case(case: VisualReviewCase) -> ReviewResult:
 
     # 5. Evidence standard
     evidence_standard_met, req_reason = _evaluate_evidence_standard(
-        observations, prepared
+        observations, prepared, facts
     )
     evidence_reason = _build_evidence_reason(
         evidence_standard_met, req_reason, observations, best
@@ -588,11 +739,11 @@ def aggregate_visual_case(case: VisualReviewCase) -> ReviewResult:
 
     # 6. Three-state claim status
     claim_status = _decide_claim_status(
-        observations, prepared, evidence_standard_met, best
+        observations, prepared, evidence_standard_met, best, facts
     )
 
     # Enforce consistency: issue_type/severity must reflect claim_status
-    if claim_status == "not_enough_information":
+    if claim_status == "not_enough_information" and not facts.identity_conflict:
         if issue_type not in {"none", "unknown"}:
             issue_type = "unknown"
         if severity not in {"none", "unknown"}:
@@ -642,6 +793,267 @@ def aggregate_visual_case(case: VisualReviewCase) -> ReviewResult:
 # ---------------------------------------------------------------------------
 # Output writers
 # ---------------------------------------------------------------------------
+
+def load_visual_reviews(
+    input_path: Path,
+    prepared_claims: Sequence[PreparedClaim],
+) -> list[VisualReviewCase]:
+    """Load Sprint 2 JSON and bind it to freshly validated PreparedClaims.
+
+    The persisted Sprint 2 artifact intentionally does not duplicate resolved
+    paths or full user-history records.  Binding by user_id restores that
+    trusted local context and rejects missing, duplicate, reordered, or
+    invented image references.
+    """
+    try:
+        payload = json.loads(input_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise DataValidationError(
+            f"Visual review JSON does not exist: {input_path}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise DataValidationError(
+            f"Visual review JSON is invalid: {exc}"
+        ) from exc
+    if not isinstance(payload, list):
+        raise DataValidationError("Visual review JSON must be an array")
+
+    prepared_by_user = {
+        item.claim.user_id: item for item in prepared_claims
+    }
+    if len(prepared_by_user) != len(prepared_claims):
+        raise DataValidationError("Prepared claims contain duplicate user_id values")
+
+    stored_by_user: dict[str, Mapping[str, Any]] = {}
+    for raw_case in payload:
+        if not isinstance(raw_case, Mapping):
+            raise DataValidationError("Each visual review case must be an object")
+        user_id = raw_case.get("user_id")
+        if not isinstance(user_id, str) or not user_id:
+            raise DataValidationError("Visual review case has invalid user_id")
+        if user_id in stored_by_user:
+            raise DataValidationError(
+                f"Visual review JSON contains duplicate user_id={user_id}"
+            )
+        stored_by_user[user_id] = raw_case
+
+    missing = set(prepared_by_user) - set(stored_by_user)
+    extra = set(stored_by_user) - set(prepared_by_user)
+    if missing or extra:
+        raise DataValidationError(
+            "Visual review case mismatch; "
+            f"missing={sorted(missing)}, extra={sorted(extra)}"
+        )
+
+    cases: list[VisualReviewCase] = []
+    for prepared in prepared_claims:
+        raw_case = stored_by_user[prepared.claim.user_id]
+        if raw_case.get("claim_object") != prepared.claim.claim_object:
+            raise DataValidationError(
+                f"Visual review changed claim_object for {prepared.claim.user_id}"
+            )
+        raw_observations = raw_case.get("observations")
+        if not isinstance(raw_observations, list):
+            raise DataValidationError(
+                f"observations must be an array for {prepared.claim.user_id}"
+            )
+        images_by_identity = {
+            (image.image_id, image.path): image
+            for image in prepared.claim.images
+        }
+        observations: list[ImageObservation] = []
+        seen_images: set[tuple[str, str]] = set()
+        for raw_observation in raw_observations:
+            observation = _stored_image_observation(raw_observation)
+            identity = (observation.image_id, observation.path)
+            image = images_by_identity.get(identity)
+            if image is None:
+                raise DataValidationError(
+                    "Visual review contains an image outside the claim: "
+                    f"{prepared.claim.user_id}:{observation.path}"
+                )
+            if identity in seen_images:
+                raise DataValidationError(
+                    f"Duplicate visual observation: {observation.path}"
+                )
+            validate_image_observation(observation, prepared, image)
+            observations.append(observation)
+            seen_images.add(identity)
+        expected_images = set(images_by_identity)
+        if seen_images != expected_images:
+            missing_images = sorted(expected_images - seen_images)
+            raise DataValidationError(
+                f"Missing visual observations for {prepared.claim.user_id}: "
+                f"{missing_images}"
+            )
+        cases.append(
+            VisualReviewCase(prepared, _stable_observations(observations))
+        )
+    return cases
+
+
+def _stored_image_observation(value: Any) -> ImageObservation:
+    if not isinstance(value, Mapping):
+        raise DataValidationError("Stored ImageObservation must be an object")
+    required = {
+        "image_id",
+        "path",
+        "actual_object",
+        "visible_parts",
+        "visible_issue_types",
+        "severity",
+        "target_part_visibility",
+        "requirement_results",
+        "fact_summary",
+        "risk_flags",
+        "reviewable",
+        "claim_target_clear",
+        "model_name",
+        "attempts",
+        "diagnostics",
+        "escalation",
+    }
+    if set(value) != required:
+        raise DataValidationError(
+            "Stored ImageObservation fields mismatch; "
+            f"missing={sorted(required - set(value))}, "
+            f"extra={sorted(set(value) - required)}"
+        )
+    requirement_values = value["requirement_results"]
+    if not isinstance(requirement_values, list):
+        raise DataValidationError("requirement_results must be an array")
+    requirement_results: list[RequirementObservation] = []
+    for item in requirement_values:
+        if not isinstance(item, Mapping) or set(item) != {
+            "requirement_id",
+            "status",
+            "reason",
+        }:
+            raise DataValidationError("Stored requirement result is invalid")
+        requirement_results.append(
+            RequirementObservation(
+                requirement_id=_stored_string(
+                    item["requirement_id"], "requirement_id"
+                ),
+                status=_stored_string(item["status"], "requirement status"),
+                reason=_stored_string(item["reason"], "requirement reason"),
+            )
+        )
+    return ImageObservation(
+        image_id=_stored_string(value["image_id"], "image_id"),
+        path=_stored_string(value["path"], "path"),
+        actual_object=_stored_string(value["actual_object"], "actual_object"),
+        visible_parts=_stored_string_tuple(
+            value["visible_parts"], "visible_parts"
+        ),
+        visible_issue_types=_stored_string_tuple(
+            value["visible_issue_types"], "visible_issue_types"
+        ),
+        severity=_stored_string(value["severity"], "severity"),
+        target_part_visibility=_stored_string(
+            value["target_part_visibility"], "target_part_visibility"
+        ),
+        requirement_results=tuple(requirement_results),
+        fact_summary=_stored_string(value["fact_summary"], "fact_summary"),
+        risk_flags=_stored_string_tuple(value["risk_flags"], "risk_flags"),
+        reviewable=_stored_bool(value["reviewable"], "reviewable"),
+        claim_target_clear=_stored_bool(
+            value["claim_target_clear"], "claim_target_clear"
+        ),
+        model_name=_stored_string(value["model_name"], "model_name"),
+        attempts=_stored_positive_int(value["attempts"], "attempts"),
+        diagnostics=_stored_string_tuple(
+            value["diagnostics"], "diagnostics", allow_empty=True
+        ),
+        escalation=_stored_escalation(value["escalation"]),
+    )
+
+
+def _stored_escalation(value: Any) -> EscalationAudit | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise DataValidationError("Stored escalation must be an object or null")
+    required = {
+        "reasons",
+        "status",
+        "review_model_name",
+        "attempts",
+        "conflicts",
+        "diagnostics",
+        "review_candidate",
+    }
+    if set(value) != required:
+        raise DataValidationError("Stored escalation fields are invalid")
+    review_model_name = value["review_model_name"]
+    if review_model_name is not None:
+        review_model_name = _stored_string(
+            review_model_name, "review_model_name"
+        )
+    review_candidate = value["review_candidate"]
+    if review_candidate is not None and not isinstance(review_candidate, Mapping):
+        raise DataValidationError("review_candidate must be an object or null")
+    return EscalationAudit(
+        reasons=_stored_string_tuple(value["reasons"], "escalation reasons"),
+        status=_stored_string(value["status"], "escalation status"),
+        review_model_name=review_model_name,
+        attempts=_stored_non_negative_int(
+            value["attempts"], "escalation attempts"
+        ),
+        conflicts=_stored_string_tuple(
+            value["conflicts"], "escalation conflicts", allow_empty=True
+        ),
+        diagnostics=_stored_string_tuple(
+            value["diagnostics"], "escalation diagnostics", allow_empty=True
+        ),
+        review_candidate=dict(review_candidate)
+        if review_candidate is not None
+        else None,
+    )
+
+
+def _stored_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise DataValidationError(f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
+def _stored_string_tuple(
+    value: Any,
+    field_name: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
+        raise DataValidationError(
+            f"{field_name} must be an array of non-empty strings"
+        )
+    result = tuple(dict.fromkeys(item.strip() for item in value))
+    if not allow_empty and not result:
+        raise DataValidationError(f"{field_name} cannot be empty")
+    return result
+
+
+def _stored_bool(value: Any, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise DataValidationError(f"{field_name} must be a boolean")
+    return value
+
+
+def _stored_non_negative_int(value: Any, field_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise DataValidationError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _stored_positive_int(value: Any, field_name: str) -> int:
+    result = _stored_non_negative_int(value, field_name)
+    if result < 1:
+        raise DataValidationError(f"{field_name} must be at least 1")
+    return result
+
 
 def write_final_output(
     cases: Iterable[VisualReviewCase],

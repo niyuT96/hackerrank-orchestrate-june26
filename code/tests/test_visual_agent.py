@@ -21,8 +21,11 @@ from main import (  # noqa: E402
     load_environment,
 )
 from visual_agent import (  # noqa: E402
+    CachingVisionClient,
     ESCALATION_REASONS,
     ReplayVisionClient,
+    VLMResponse,
+    VisionClient,
     VisionReviewer,
     encode_image,
     image_observation_schema,
@@ -31,6 +34,21 @@ from visual_agent import (  # noqa: E402
     write_visual_reviews,
     write_visual_traces,
 )
+
+
+class CountingVisionClient(VisionClient):
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = 0
+        self.model = "counting-model"
+
+    def analyze(self, prepared, image, encoded, prompt, schema):
+        self.calls += 1
+        return VLMResponse(
+            payload=self.payload,
+            raw_response={"call": self.calls},
+            model_name=self.model,
+        )
 
 
 class EnvironmentConfigurationTests(unittest.TestCase):
@@ -130,6 +148,21 @@ class ImageEncodingTests(unittest.TestCase):
         self.assertTrue(encoded.data_url.startswith("data:image/jpeg;base64,"))
         self.assertGreater(encoded.original_width, 0)
         self.assertGreater(encoded.original_height, 0)
+
+    def test_content_cache_avoids_duplicate_model_call(self) -> None:
+        image = self.prepared.claim.images[0]
+        encoded = encode_image(image.resolved_path)
+        client = CountingVisionClient(valid_payload(self.prepared, image))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cached = CachingVisionClient(client, Path(temp_dir))
+            first = cached.analyze(
+                self.prepared, image, encoded, "prompt", {"type": "object"}
+            )
+            second = cached.analyze(
+                self.prepared, image, encoded, "prompt", {"type": "object"}
+            )
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(first.payload, second.payload)
 
 
 class ObservationValidationTests(unittest.TestCase):
